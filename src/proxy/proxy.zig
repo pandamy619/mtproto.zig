@@ -278,7 +278,7 @@ fn handleConnectionInner(
     );
     defer state.allocator.free(server_hello);
 
-    _ = try client_stream.write(server_hello);
+    try writeAll(client_stream, server_hello);
 
     // Read 64-byte MTProto handshake (wrapped in TLS Application Data)
     // The client may send a Change Cipher Spec (CCS) record first — skip it.
@@ -385,7 +385,7 @@ fn handleConnectionInner(
     @memcpy(nonce_to_send[0..constants.proto_tag_pos], tg_nonce[0..constants.proto_tag_pos]);
     @memcpy(nonce_to_send[constants.proto_tag_pos..], encrypted_nonce[constants.proto_tag_pos..]);
 
-    _ = try dc_stream.write(&nonce_to_send);
+    try writeAll(dc_stream, &nonce_to_send);
     // tg_encryptor counter is now at position 4 (past 64 bytes), correct for subsequent data
 
     var tg_decryptor = crypto.AesCtr.init(&tg_dec_key, tg_dec_iv);
@@ -421,6 +421,8 @@ fn handleConnectionInner(
     // Fix #3: Handle pipelined data — Telegram clients send their first RPC request
     // immediately after the 64-byte handshake in the same TLS record. If we don't
     // forward these bytes, the client's first message is silently lost.
+    var initial_c2s_bytes: u64 = 0;
+
     if (payload_len > constants.handshake_len) {
         const pipelined = payload_buf[constants.handshake_len..payload_len];
         log.info("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
@@ -428,6 +430,7 @@ fn handleConnectionInner(
         client_decryptor.apply(pipelined);
         tg_encryptor.apply(pipelined);
         try writeAll(dc_stream, pipelined);
+        initial_c2s_bytes = pipelined.len;
     } else {
         log.info("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
     }
@@ -439,11 +442,23 @@ fn handleConnectionInner(
         &client_encryptor,
         &tg_encryptor,
         &tg_decryptor,
+        initial_c2s_bytes,
         conn_id,
     ) catch |err| {
         log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
     };
 }
+
+/// Relay progress tracking: distinguishes between no data available,
+/// partial TLS record assembly, and fully forwarded payloads.
+const RelayProgress = enum {
+    /// No data was read (WouldBlock on first read)
+    none,
+    /// Some bytes were consumed but a full record hasn't been forwarded yet
+    partial,
+    /// At least one complete record was forwarded
+    forwarded,
+};
 
 /// Bidirectional relay between client (TLS + AES-CTR) and Telegram DC (AES-CTR).
 ///
@@ -457,6 +472,7 @@ fn relayBidirectional(
     client_encryptor: *crypto.AesCtr,
     tg_encryptor: *crypto.AesCtr,
     tg_decryptor: *crypto.AesCtr,
+    initial_c2s_bytes: u64,
     conn_id: u64,
 ) !void {
     var fds = [2]posix.pollfd{
@@ -478,36 +494,31 @@ fn relayBidirectional(
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
 
     // Byte counters for diagnostics
-    var c2s_bytes: u64 = 0;
+    var c2s_bytes: u64 = initial_c2s_bytes;
     var s2c_bytes: u64 = 0;
     var poll_iterations: u64 = 0;
-    var no_progress_count: u32 = 0;
+    var no_progress_polls: u32 = 0;
 
     while (true) {
+        fds[0].revents = 0;
+        fds[1].revents = 0;
+
         const ready = try posix.poll(&fds, relay_timeout_ms);
         if (ready == 0) {
             log.debug("[{d}] Relay: idle timeout (no data for 5 min), c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
             return error.ConnectionReset;
         }
+
         poll_iterations += 1;
+        var progressed = false;
 
-        // Check for errors/hangup/invalid FD
-        const err_mask = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
-        if (fds[0].revents & err_mask != 0) {
-            log.debug("[{d}] Relay: client side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[0].revents, poll_iterations, c2s_bytes, s2c_bytes });
-            return error.ConnectionReset;
-        }
-        if (fds[1].revents & err_mask != 0) {
-            log.debug("[{d}] Relay: DC side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[1].revents, poll_iterations, c2s_bytes, s2c_bytes });
-            return error.ConnectionReset;
-        }
+        const client_revents = fds[0].revents;
+        const dc_revents = fds[1].revents;
 
-        // Track progress to detect spin loops
-        const bytes_before = c2s_bytes + s2c_bytes;
-
-        // Client → DC (C2S): read TLS records, unwrap, decrypt, re-encrypt, forward
-        if (fds[0].revents & posix.POLL.IN != 0) {
-            relayClientToDc(
+        // IMPORTANT: drain readable data first. POLLIN|POLLHUP is common on Linux
+        // when the peer has sent final bytes and then closed.
+        if ((client_revents & posix.POLL.IN) != 0) {
+            const step = relayClientToDc(
                 client,
                 dc,
                 client_decryptor,
@@ -523,11 +534,11 @@ fn relayBidirectional(
                 log.debug("[{d}] Relay: C2S error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
                 return err;
             };
+            if (step != .none) progressed = true;
         }
 
-        // DC → Client (S2C): read raw, decrypt DC, encrypt client, wrap in TLS
-        if (fds[1].revents & posix.POLL.IN != 0) {
-            relayDcToClient(
+        if ((dc_revents & posix.POLL.IN) != 0) {
+            const step = relayDcToClient(
                 dc,
                 client,
                 tg_decryptor,
@@ -539,18 +550,58 @@ fn relayBidirectional(
                 log.debug("[{d}] Relay: S2C error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
                 return err;
             };
+            if (step != .none) progressed = true;
         }
 
-        // Spin detection: if poll() returned ready but no bytes transferred,
-        // increment counter. Terminate if stuck in a tight loop.
-        if (c2s_bytes + s2c_bytes == bytes_before) {
-            no_progress_count += 1;
-            if (no_progress_count >= 100) {
-                log.warn("[{d}] Relay: spin detected ({d} no-progress polls), terminating. c2s={d} s2c={d}", .{ conn_id, no_progress_count, c2s_bytes, s2c_bytes });
+        // Hard errors after draining readable data
+        if ((client_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+            log.debug("[{d}] Relay: client ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
+                conn_id, client_revents, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+        if ((dc_revents & (posix.POLL.ERR | posix.POLL.NVAL)) != 0) {
+            log.debug("[{d}] Relay: DC ERR/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{
+                conn_id, dc_revents, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+
+        // If HUP arrived without readable data, close immediately.
+        // If it arrived with POLLIN, we already drained what we could above.
+        if (((client_revents & posix.POLL.HUP) != 0) and ((client_revents & posix.POLL.IN) == 0)) {
+            log.debug("[{d}] Relay: client HUP, polls={d} c2s={d} s2c={d}", .{
+                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+        if (((dc_revents & posix.POLL.HUP) != 0) and ((dc_revents & posix.POLL.IN) == 0)) {
+            log.debug("[{d}] Relay: DC HUP, polls={d} c2s={d} s2c={d}", .{
+                conn_id, poll_iterations, c2s_bytes, s2c_bytes,
+            });
+            return error.ConnectionReset;
+        }
+
+        // Spin detection: track progress including partial TLS record assembly.
+        // Old approach only checked byte counters, missing partial reads that
+        // represent real forward progress.
+        if (!progressed) {
+            no_progress_polls += 1;
+            if (no_progress_polls >= 32) {
+                log.warn("[{d}] Relay: no-progress poll loop, client_revents=0x{x} dc_revents=0x{x} hdr={d} body_pos={d} body_len={d} c2s={d} s2c={d}", .{
+                    conn_id,
+                    client_revents,
+                    dc_revents,
+                    tls_hdr_pos,
+                    tls_body_pos,
+                    tls_body_len,
+                    c2s_bytes,
+                    s2c_bytes,
+                });
                 return error.ConnectionReset;
             }
         } else {
-            no_progress_count = 0;
+            no_progress_polls = 0;
         }
     }
 }
@@ -559,6 +610,7 @@ fn relayBidirectional(
 ///
 /// Uses incremental state so partial reads across poll iterations are handled correctly.
 /// Both CCS and Application Data records share the same body buffer to survive WouldBlock.
+/// Returns progress indicator for spin detection in the relay loop.
 fn relayClientToDc(
     client: net.Stream,
     dc: net.Stream,
@@ -571,39 +623,45 @@ fn relayClientToDc(
     tls_body_len: *usize,
     bytes_counter: *u64,
     conn_id: u64,
-) !void {
+) !RelayProgress {
+    _ = conn_id;
+
+    var consumed_any = false;
+
     // Read as much as possible in this call
     while (true) {
         if (tls_hdr_pos.* < tls_header_len) {
             // Still reading TLS header
             const nr = client.read(tls_hdr_buf[tls_hdr_pos.*..]) catch |err| {
-                return if (err == error.WouldBlock) {} else err;
+                if (err == error.WouldBlock) {
+                    return if (consumed_any) .partial else .none;
+                }
+                return err;
             };
             if (nr == 0) return error.ConnectionReset;
+
+            consumed_any = true;
             tls_hdr_pos.* += nr;
 
-            if (tls_hdr_pos.* < tls_header_len) return; // need more header bytes
+            if (tls_hdr_pos.* < tls_header_len) return .partial; // need more header bytes
 
             // Parse TLS record header
             const record_type = tls_hdr_buf[0];
 
             if (record_type == constants.tls_record_alert) {
                 // Alert = peer closing
-                log.info("[{d}] C2S: received TLS Alert, c2s={d}", .{ conn_id, bytes_counter.* });
                 return error.ConnectionReset;
             }
 
-            if (record_type == constants.tls_record_change_cipher or
-                record_type == constants.tls_record_application)
-            {
-                tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
-                if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
-                    return error.ConnectionReset;
-                }
-                tls_body_pos.* = 0;
-            } else {
-                // Unexpected record type
-                return error.ConnectionReset;
+            switch (record_type) {
+                constants.tls_record_change_cipher, constants.tls_record_application => {
+                    tls_body_len.* = std.mem.readInt(u16, tls_hdr_buf[3..5], .big);
+                    if (tls_body_len.* == 0 or tls_body_len.* > max_tls_payload) {
+                        return error.ConnectionReset;
+                    }
+                    tls_body_pos.* = 0;
+                },
+                else => return error.ConnectionReset,
             }
         }
 
@@ -614,16 +672,22 @@ fn relayClientToDc(
             tls_hdr_pos.* = 0;
             tls_body_pos.* = 0;
             tls_body_len.* = 0;
+            if (consumed_any) return .partial;
             continue;
         }
 
         const nr = client.read(tls_body_buf[tls_body_pos.*..][0..remaining]) catch |err| {
-            return if (err == error.WouldBlock) {} else err;
+            if (err == error.WouldBlock) {
+                return if (consumed_any) .partial else .none;
+            }
+            return err;
         };
         if (nr == 0) return error.ConnectionReset;
+
+        consumed_any = true;
         tls_body_pos.* += nr;
 
-        if (tls_body_pos.* < tls_body_len.*) return; // need more body bytes
+        if (tls_body_pos.* < tls_body_len.*) return .partial; // need more body bytes
 
         // Full record body received — check record type
         if (tls_hdr_buf[0] == constants.tls_record_change_cipher) {
@@ -651,12 +715,13 @@ fn relayClientToDc(
         tls_hdr_pos.* = 0;
         tls_body_pos.* = 0;
         tls_body_len.* = 0;
-        return; // processed one record, return to poll
+        return .forwarded; // processed one record, return to poll
     }
 }
 
 /// S2C direction: Read from DC, AES-CTR decrypt DC, AES-CTR encrypt for client, wrap in TLS, send.
 /// Uses DRS (Dynamic Record Sizing) to mimic real browser TLS behavior.
+/// Returns progress indicator for spin detection in the relay loop.
 fn relayDcToClient(
     dc: net.Stream,
     client: net.Stream,
@@ -665,15 +730,14 @@ fn relayDcToClient(
     dc_read_buf: *[constants.default_buffer_size]u8,
     drs: *DynamicRecordSizer,
     bytes_counter: *u64,
-) !void {
+) !RelayProgress {
     const nr = dc.read(dc_read_buf) catch |err| {
-        return if (err == error.WouldBlock) {} else err;
+        if (err == error.WouldBlock) return .none;
+        return err;
     };
     if (nr == 0) return error.ConnectionReset;
 
     const data = dc_read_buf[0..nr];
-
-    bytes_counter.* += nr;
 
     // AES-CTR decrypt DC obfuscation
     tg_decryptor.apply(data);
@@ -700,28 +764,39 @@ fn relayDcToClient(
         drs.recordSent(chunk_len);
         offset += chunk_len;
     }
+
+    bytes_counter.* += nr;
+    return .forwarded;
 }
 
 /// Write all bytes to a stream, handling partial writes and backpressure.
 /// On non-blocking sockets, waits for POLLOUT when the send buffer is full.
+/// Includes a spin counter to prevent infinite WouldBlock loops on broken sockets.
 fn writeAll(stream: net.Stream, data: []const u8) !void {
     var written: usize = 0;
+    var wouldblock_spins: u8 = 0;
+
     while (written < data.len) {
         const nw = stream.write(data[written..]) catch |err| {
             if (err == error.WouldBlock) {
+                wouldblock_spins += 1;
+                if (wouldblock_spins >= 32) return error.ConnectionReset;
+
                 // Wait for the socket to become writable
                 var fds = [1]posix.pollfd{
                     .{ .fd = stream.handle, .events = posix.POLL.OUT, .revents = 0 },
                 };
                 const ready = try posix.poll(&fds, relay_timeout_ms);
                 if (ready == 0) return error.ConnectionReset; // write timeout
-                if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0)
+                if ((fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL)) != 0)
                     return error.ConnectionReset;
+                if ((fds[0].revents & posix.POLL.OUT) == 0) continue;
                 continue;
             }
             return err;
         };
         if (nw == 0) return error.ConnectionReset;
+        wouldblock_spins = 0;
         written += nw;
     }
 }
