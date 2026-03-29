@@ -91,6 +91,12 @@ pub const ProxyState = struct {
     user_secrets: []const obfuscation.UserSecret,
     /// Connection counter for logging
     connection_count: std.atomic.Value(u64),
+    /// Active concurrent connections (for overload protection)
+    active_connections: std.atomic.Value(u32),
+
+    /// Maximum concurrent connections before rejecting new ones.
+    /// Prevents thread exhaustion under load.
+    const max_connections: u32 = 8192;
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) ProxyState {
         var secrets: std.ArrayList(obfuscation.UserSecret) = .empty;
@@ -107,6 +113,7 @@ pub const ProxyState = struct {
             .config = cfg,
             .user_secrets = secrets.toOwnedSlice(allocator) catch &.{},
             .connection_count = std.atomic.Value(u64).init(0),
+            .active_connections = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -132,6 +139,14 @@ pub const ProxyState = struct {
 
             const conn_id = self.connection_count.fetchAdd(1, .monotonic);
 
+            // Overload protection: reject if too many concurrent connections
+            const active = self.active_connections.load(.monotonic);
+            if (active >= max_connections) {
+                log.warn("[{d}] Connection rejected: at capacity ({d}/{d})", .{ conn_id, active, max_connections });
+                conn.stream.close();
+                continue;
+            }
+
             const thread = std.Thread.spawn(.{
                 // Proxy threads just shuffle bytes between sockets + AES-CTR (no deep recursion).
                 // 128 KB is plenty. Default 8-16 MB per thread would exhaust memory with thousands
@@ -156,26 +171,34 @@ fn handleConnection(
 ) void {
     defer client_stream.close();
 
-    handleConnectionInner(state, client_stream, conn_id) catch |err| {
+    // Track active connections for overload protection
+    _ = state.active_connections.fetchAdd(1, .monotonic);
+    defer _ = state.active_connections.fetchSub(1, .monotonic);
+
+    // Format peer IP for logging
+    var addr_buf: [64]u8 = undefined;
+    const peer_str = formatAddress(peer_addr, &addr_buf);
+
+    handleConnectionInner(state, client_stream, peer_str, conn_id) catch |err| {
         // Idle pool closure is normal — mobile clients pre-warm connections
         // that may never send data. Don't pollute logs.
         if (err == error.IdleConnectionClosed) {
-            log.debug("[{d}] Closed idle pooled connection", .{conn_id});
+            log.debug("[{d}] ({s}) Closed idle pooled connection", .{ conn_id, peer_str });
             return;
         }
         // WouldBlock during handshake = Slowloris or extreme lag
         if (err == error.WouldBlock) {
-            log.warn("[{d}] Handshake timeout (Slowloris/lag)", .{conn_id});
+            log.warn("[{d}] ({s}) Handshake timeout (Slowloris/lag)", .{ conn_id, peer_str });
             return;
         }
-        log.err("[{d}] Connection error: {any}", .{ conn_id, err });
+        log.err("[{d}] ({s}) Connection error: {any}", .{ conn_id, peer_str, err });
     };
-    _ = peer_addr;
 }
 
 fn handleConnectionInner(
     state: *ProxyState,
     client_stream: net.Stream,
+    peer_str: []const u8,
     conn_id: u64,
 ) !void {
     // === Two-Stage Timeout (Split Timeout) ===
@@ -213,7 +236,7 @@ fn handleConnectionInner(
     if (n < 5) return;
 
     if (!tls.isTlsHandshake(&first_bytes)) {
-        log.debug("[{d}] Non-TLS connection, dropping", .{conn_id});
+        log.debug("[{d}] ({s}) Non-TLS connection, dropping. First bytes: {x:0>2}", .{ conn_id, peer_str, first_bytes });
         return;
     }
 
@@ -239,12 +262,12 @@ fn handleConnectionInner(
     );
 
     if (validation == null) {
-        log.debug("[{d}] TLS auth failed", .{conn_id});
+        log.debug("[{d}] ({s}) TLS auth failed", .{ conn_id, peer_str });
         return;
     }
 
     const v = validation.?;
-    log.info("[{d}] TLS auth OK: user={s}", .{ conn_id, v.user });
+    log.info("[{d}] ({s}) TLS auth OK: user={s}", .{ conn_id, peer_str, v.user });
 
     // Send ServerHello response
     const server_hello = try tls.buildServerHello(
@@ -252,7 +275,6 @@ fn handleConnectionInner(
         &v.secret,
         &v.digest,
         v.session_id,
-        1024,
     );
     defer state.allocator.free(server_hello);
 
@@ -275,7 +297,7 @@ fn handleConnectionInner(
             continue;
         }
 
-        log.debug("[{d}] Unexpected TLS record type after ServerHello: 0x{x:0>2}", .{ conn_id, tls_header[0] });
+        log.debug("[{d}] ({s}) Unexpected TLS record type after ServerHello: 0x{x:0>2}", .{ conn_id, peer_str, tls_header[0] });
         return;
     }
 
@@ -290,18 +312,25 @@ fn handleConnectionInner(
 
     // Parse obfuscation params
     const result = obfuscation.ObfuscationParams.fromHandshake(handshake, state.user_secrets) orelse {
-        log.debug("[{d}] MTProto handshake failed for user {s}", .{ conn_id, v.user });
+        log.debug("[{d}] ({s}) MTProto handshake failed for user {s}", .{ conn_id, peer_str, v.user });
         return;
     };
 
     var params = result.params;
     defer params.wipe();
 
-    log.info("[{d}] MTProto OK: user={s} dc={d} proto={any}", .{
+    log.info("[{d}] ({s}) MTProto OK: user={s} dc={d} proto={any}", .{
         conn_id,
+        peer_str,
         result.user,
         params.dc_idx,
         params.proto_tag,
+    });
+
+    // Diagnostic: log client cipher details
+    log.info("[{d}] ({s}) Client dec_iv=0x{x:0>32} enc_iv=0x{x:0>32}", .{
+        conn_id,                      peer_str,
+        @as(u128, params.decrypt_iv), @as(u128, params.encrypt_iv),
     });
 
     // Resolve DC address — use @abs() to avoid overflow when dc_idx == minInt(i16)
@@ -315,10 +344,10 @@ fn handleConnectionInner(
     if (dc_idx >= constants.tg_datacenters_v4.len) return;
 
     const dc_addr = constants.tg_datacenters_v4[dc_idx];
-    log.info("[{d}] Connecting to DC {d}", .{ conn_id, params.dc_idx });
+    log.info("[{d}] ({s}) Connecting to DC {d}", .{ conn_id, peer_str, params.dc_idx });
 
     const dc_stream = net.tcpConnectToAddress(dc_addr) catch |err| {
-        log.err("[{d}] DC connect failed: {any}", .{ conn_id, err });
+        log.err("[{d}] ({s}) DC connect failed: {any}", .{ conn_id, peer_str, err });
         return;
     };
     defer dc_stream.close();
@@ -368,7 +397,7 @@ fn handleConnectionInner(
     @memset(&tg_dec_key, 0);
     @memset(&tg_dec_key_iv, 0);
 
-    log.info("[{d}] Relaying traffic", .{conn_id});
+    log.info("[{d}] ({s}) Relaying traffic", .{ conn_id, peer_str });
 
     // Set both sockets to non-blocking to prevent deadlocks with poll().
     // The relay handlers already handle WouldBlock errors correctly.
@@ -394,10 +423,13 @@ fn handleConnectionInner(
     // forward these bytes, the client's first message is silently lost.
     if (payload_len > constants.handshake_len) {
         const pipelined = payload_buf[constants.handshake_len..payload_len];
+        log.info("[{d}] ({s}) Pipelined {d}B after handshake", .{ conn_id, peer_str, pipelined.len });
         // Decrypt with client cipher, re-encrypt with DC cipher
         client_decryptor.apply(pipelined);
         tg_encryptor.apply(pipelined);
         try writeAll(dc_stream, pipelined);
+    } else {
+        log.info("[{d}] ({s}) No pipelined data after handshake", .{ conn_id, peer_str });
     }
 
     relayBidirectional(
@@ -409,7 +441,7 @@ fn handleConnectionInner(
         &tg_decryptor,
         conn_id,
     ) catch |err| {
-        log.debug("[{d}] Relay ended: {any}", .{ conn_id, err });
+        log.debug("[{d}] ({s}) Relay ended: {any}", .{ conn_id, peer_str, err });
     };
 }
 
@@ -427,8 +459,6 @@ fn relayBidirectional(
     tg_decryptor: *crypto.AesCtr,
     conn_id: u64,
 ) !void {
-    _ = conn_id;
-
     var fds = [2]posix.pollfd{
         .{ .fd = client.handle, .events = posix.POLL.IN, .revents = 0 },
         .{ .fd = dc.handle, .events = posix.POLL.IN, .revents = 0 },
@@ -447,17 +477,37 @@ fn relayBidirectional(
     // Buffer for DC → client direction
     var dc_read_buf: [constants.default_buffer_size]u8 = undefined;
 
+    // Byte counters for diagnostics
+    var c2s_bytes: u64 = 0;
+    var s2c_bytes: u64 = 0;
+    var poll_iterations: u64 = 0;
+    var no_progress_count: u32 = 0;
+
     while (true) {
         const ready = try posix.poll(&fds, relay_timeout_ms);
-        if (ready == 0) return error.ConnectionReset; // idle timeout — close ghost connection
+        if (ready == 0) {
+            log.debug("[{d}] Relay: idle timeout (no data for 5 min), c2s={d} s2c={d}", .{ conn_id, c2s_bytes, s2c_bytes });
+            return error.ConnectionReset;
+        }
+        poll_iterations += 1;
 
-        // Check for errors/hangup first
-        if (fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return;
-        if (fds[1].revents & (posix.POLL.ERR | posix.POLL.HUP) != 0) return;
+        // Check for errors/hangup/invalid FD
+        const err_mask = posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL;
+        if (fds[0].revents & err_mask != 0) {
+            log.debug("[{d}] Relay: client side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[0].revents, poll_iterations, c2s_bytes, s2c_bytes });
+            return error.ConnectionReset;
+        }
+        if (fds[1].revents & err_mask != 0) {
+            log.debug("[{d}] Relay: DC side ERR/HUP/NVAL (revents=0x{x}), polls={d} c2s={d} s2c={d}", .{ conn_id, fds[1].revents, poll_iterations, c2s_bytes, s2c_bytes });
+            return error.ConnectionReset;
+        }
+
+        // Track progress to detect spin loops
+        const bytes_before = c2s_bytes + s2c_bytes;
 
         // Client → DC (C2S): read TLS records, unwrap, decrypt, re-encrypt, forward
         if (fds[0].revents & posix.POLL.IN != 0) {
-            try relayClientToDc(
+            relayClientToDc(
                 client,
                 dc,
                 client_decryptor,
@@ -467,19 +517,40 @@ fn relayBidirectional(
                 &tls_body_buf,
                 &tls_body_pos,
                 &tls_body_len,
-            );
+                &c2s_bytes,
+                conn_id,
+            ) catch |err| {
+                log.debug("[{d}] Relay: C2S error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
+                return err;
+            };
         }
 
         // DC → Client (S2C): read raw, decrypt DC, encrypt client, wrap in TLS
         if (fds[1].revents & posix.POLL.IN != 0) {
-            try relayDcToClient(
+            relayDcToClient(
                 dc,
                 client,
                 tg_decryptor,
                 client_encryptor,
                 &dc_read_buf,
                 &drs,
-            );
+                &s2c_bytes,
+            ) catch |err| {
+                log.debug("[{d}] Relay: S2C error: {any}, polls={d} c2s={d} s2c={d}", .{ conn_id, err, poll_iterations, c2s_bytes, s2c_bytes });
+                return err;
+            };
+        }
+
+        // Spin detection: if poll() returned ready but no bytes transferred,
+        // increment counter. Terminate if stuck in a tight loop.
+        if (c2s_bytes + s2c_bytes == bytes_before) {
+            no_progress_count += 1;
+            if (no_progress_count >= 100) {
+                log.warn("[{d}] Relay: spin detected ({d} no-progress polls), terminating. c2s={d} s2c={d}", .{ conn_id, no_progress_count, c2s_bytes, s2c_bytes });
+                return error.ConnectionReset;
+            }
+        } else {
+            no_progress_count = 0;
         }
     }
 }
@@ -498,6 +569,8 @@ fn relayClientToDc(
     tls_body_buf: *[max_tls_payload]u8,
     tls_body_pos: *usize,
     tls_body_len: *usize,
+    bytes_counter: *u64,
+    conn_id: u64,
 ) !void {
     // Read as much as possible in this call
     while (true) {
@@ -516,6 +589,7 @@ fn relayClientToDc(
 
             if (record_type == constants.tls_record_alert) {
                 // Alert = peer closing
+                log.info("[{d}] C2S: received TLS Alert, c2s={d}", .{ conn_id, bytes_counter.* });
                 return error.ConnectionReset;
             }
 
@@ -571,6 +645,7 @@ fn relayClientToDc(
 
         // Send to DC
         try writeAll(dc, payload);
+        bytes_counter.* += payload.len;
 
         // Reset for next TLS record
         tls_hdr_pos.* = 0;
@@ -589,6 +664,7 @@ fn relayDcToClient(
     client_encryptor: *crypto.AesCtr,
     dc_read_buf: *[constants.default_buffer_size]u8,
     drs: *DynamicRecordSizer,
+    bytes_counter: *u64,
 ) !void {
     const nr = dc.read(dc_read_buf) catch |err| {
         return if (err == error.WouldBlock) {} else err;
@@ -596,6 +672,8 @@ fn relayDcToClient(
     if (nr == 0) return error.ConnectionReset;
 
     const data = dc_read_buf[0..nr];
+
+    bytes_counter.* += nr;
 
     // AES-CTR decrypt DC obfuscation
     tg_decryptor.apply(data);
@@ -660,6 +738,25 @@ fn readExact(stream: net.Stream, buf: []u8) !usize {
         total += nr;
     }
     return total;
+}
+
+/// Format a network address as "ip:port" for logging.
+fn formatAddress(addr: net.Address, buf: *[64]u8) []const u8 {
+    switch (addr.any.family) {
+        posix.AF.INET => {
+            const bytes: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+            return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+                bytes[0],                                  bytes[1], bytes[2], bytes[3],
+                std.mem.bigToNative(u16, addr.in.sa.port),
+            }) catch "?";
+        },
+        posix.AF.INET6 => {
+            return std.fmt.bufPrint(buf, "[ipv6]:{d}", .{
+                std.mem.bigToNative(u16, addr.in6.sa.port),
+            }) catch "?";
+        },
+        else => return "?",
+    }
 }
 
 /// Set a file descriptor to non-blocking mode.

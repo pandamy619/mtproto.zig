@@ -97,17 +97,26 @@ pub fn validateTlsHandshake(
 
 /// Build a fake TLS ServerHello response.
 ///
-/// Includes ServerHello record, Change Cipher Spec, and a fake
-/// Application Data record (mimicking encrypted certificates).
+/// The response consists of three TLS records that the client validates:
+/// 1. ServerHello record (type 0x16) — contains the HMAC digest in the `random` field
+/// 2. Change Cipher Spec record (type 0x14) — fixed 6 bytes
+/// 3. Fake Application Data record (type 0x17) — random body simulating encrypted data
+///
+/// The client (ConnectionSocket.cpp) validates the response by:
+/// - Checking for `\x16\x03\x03` prefix (ServerHello record)
+/// - Reading len1 (ServerHello record payload length)
+/// - Checking for `\x14\x03\x03\x00\x01\x01\x17\x03\x03` after the ServerHello record
+/// - Reading len2 (Application Data payload length)
+/// - Waiting for all `len1 + 5 + 11 + len2` bytes
+/// - Saving bytes at offset 11..43 (the random field), zeroing them
+/// - Computing HMAC-SHA256(secret, client_digest || entire_response_with_zeroed_random)
+/// - Comparing the HMAC to the saved random field (straight 32-byte compare, no XOR)
 pub fn buildServerHello(
     allocator: std.mem.Allocator,
     secret: []const u8,
     client_digest: *const [constants.tls_digest_len]u8,
     session_id: []const u8,
-    fake_cert_len: usize,
 ) ![]u8 {
-    const cert_len = @max(64, @min(fake_cert_len, constants.max_tls_ciphertext_size));
-
     // Generate random X25519-like key (just random bytes for fake TLS)
     var x25519_key: [32]u8 = undefined;
     crypto.randomBytes(&x25519_key);
@@ -135,8 +144,20 @@ pub fn buildServerHello(
     const record_len: u16 = @intCast(@as(u32, body_len) + 4);
     const server_hello_len = 5 + @as(usize, record_len);
     const ccs_len: usize = 6;
-    const app_data_len = 5 + cert_len;
-    const total_len = server_hello_len + ccs_len + app_data_len;
+
+    // Fake Application Data record: simulates encrypted handshake data.
+    // The canonical Python proxy uses random.randrange(1024, 4096) bytes.
+    // We use a deterministic-ish size within that range.
+    const fake_app_data_body_len: u16 = blk: {
+        var len_buf: [2]u8 = undefined;
+        crypto.randomBytes(&len_buf);
+        const raw = std.mem.readInt(u16, &len_buf, .big);
+        // Map to range [1024, 4096): 1024 + (raw % 3072)
+        break :blk 1024 + (raw % 3072);
+    };
+    const app_data_record_len: usize = 5 + @as(usize, fake_app_data_body_len);
+
+    const total_len = server_hello_len + ccs_len + app_data_record_len;
 
     const response = try allocator.alloc(u8, total_len);
     errdefer allocator.free(response);
@@ -201,26 +222,30 @@ pub fn buildServerHello(
     pos += 6;
 
     // --- Fake Application Data record ---
+    // The client expects \x17\x03\x03 + 2-byte length + body after the CCS record.
     response[pos] = constants.tls_record_application;
-    pos += 1;
-    @memcpy(response[pos..][0..2], &constants.tls_version);
-    pos += 2;
-    std.mem.writeInt(u16, response[pos..][0..2], @intCast(cert_len), .big);
-    pos += 2;
-    crypto.randomBytes(response[pos..][0..cert_len]);
-    pos += cert_len;
+    response[pos + 1] = constants.tls_version[0];
+    response[pos + 2] = constants.tls_version[1];
+    std.mem.writeInt(u16, response[pos + 3 ..][0..2], fake_app_data_body_len, .big);
+    pos += 5;
+
+    // Fill with random bytes to simulate encrypted handshake data
+    crypto.randomBytes(response[pos..][0..fake_app_data_body_len]);
+    pos += fake_app_data_body_len;
 
     std.debug.assert(pos == total_len);
 
-    // Compute HMAC for the response
-    // hmac_input = client_digest || response
+    // Compute HMAC over the ENTIRE response (all three records) with random field zeroed.
+    // The client validates: HMAC-SHA256(secret, client_digest || full_response_zeroed_random)
+    // and compares the result to the 32 bytes at offset 11 (straight compare, no XOR).
     const hmac_input = try allocator.alloc(u8, constants.tls_digest_len + total_len);
     defer allocator.free(hmac_input);
     @memcpy(hmac_input[0..constants.tls_digest_len], client_digest);
-    @memcpy(hmac_input[constants.tls_digest_len..], response);
+    @memcpy(hmac_input[constants.tls_digest_len..], response[0..total_len]);
+
     const response_digest = crypto.sha256Hmac(secret, hmac_input);
 
-    // Insert digest into ServerHello random field
+    // Insert digest into ServerHello random field (no timestamp XOR for server response)
     @memcpy(response[random_pos..][0..32], &response_digest);
 
     return response;
@@ -324,7 +349,7 @@ test "timing_safe.eql" {
     try std.testing.expect(!std.crypto.timing_safe.eql([3]u8, a, c));
 }
 
-test "buildServerHello produces valid structure" {
+test "buildServerHello produces valid three-record structure" {
     const allocator = std.testing.allocator;
     var digest = [_]u8{0x42} ** 32;
     const session_id = [_]u8{0x01} ** 32;
@@ -334,15 +359,57 @@ test "buildServerHello produces valid structure" {
         &digest,
         &digest,
         &session_id,
-        256,
     );
     defer allocator.free(response);
 
-    // Should start with TLS record handshake
+    // Record 1: ServerHello (\x16\x03\x03)
     try std.testing.expectEqual(@as(u8, constants.tls_record_handshake), response[0]);
-    // Version bytes
     try std.testing.expectEqual(@as(u8, 0x03), response[1]);
     try std.testing.expectEqual(@as(u8, 0x03), response[2]);
-    // Should have CCS record somewhere
-    try std.testing.expect(response.len > 50);
+
+    const len1 = std.mem.readInt(u16, response[3..5], .big);
+    const ccs_start = 5 + @as(usize, len1);
+
+    // Record 2: Change Cipher Spec (\x14\x03\x03\x00\x01\x01)
+    try std.testing.expect(response.len > ccs_start + 6);
+    try std.testing.expectEqual(@as(u8, constants.tls_record_change_cipher), response[ccs_start]);
+    try std.testing.expectEqual(@as(u8, 0x03), response[ccs_start + 1]);
+    try std.testing.expectEqual(@as(u8, 0x03), response[ccs_start + 2]);
+    try std.testing.expectEqual(@as(u8, 0x00), response[ccs_start + 3]);
+    try std.testing.expectEqual(@as(u8, 0x01), response[ccs_start + 4]);
+    try std.testing.expectEqual(@as(u8, 0x01), response[ccs_start + 5]);
+
+    // Record 3: Application Data (\x17\x03\x03)
+    const app_start = ccs_start + 6;
+    try std.testing.expect(response.len > app_start + 5);
+    try std.testing.expectEqual(@as(u8, constants.tls_record_application), response[app_start]);
+    try std.testing.expectEqual(@as(u8, 0x03), response[app_start + 1]);
+    try std.testing.expectEqual(@as(u8, 0x03), response[app_start + 2]);
+
+    const len2 = std.mem.readInt(u16, response[app_start + 3 ..][0..2], .big);
+    // Fake AppData body should be in [1024, 4096)
+    try std.testing.expect(len2 >= 1024);
+    try std.testing.expect(len2 < 4096);
+
+    // Total response length should match all three records
+    try std.testing.expectEqual(5 + @as(usize, len1) + 6 + 5 + @as(usize, len2), response.len);
+
+    // HMAC digest is at offset 11 (tls_digest_pos) in the response
+    // Verify it by recomputing: HMAC(secret, client_digest || response_with_zeroed_random)
+    var zeroed = try allocator.alloc(u8, response.len);
+    defer allocator.free(zeroed);
+    @memcpy(zeroed, response);
+    @memset(zeroed[constants.tls_digest_pos..][0..constants.tls_digest_len], 0);
+
+    var hmac_input = try allocator.alloc(u8, constants.tls_digest_len + response.len);
+    defer allocator.free(hmac_input);
+    @memcpy(hmac_input[0..constants.tls_digest_len], &digest);
+    @memcpy(hmac_input[constants.tls_digest_len..], zeroed);
+
+    const expected_hmac = crypto.sha256Hmac(&digest, hmac_input);
+    try std.testing.expect(std.crypto.timing_safe.eql(
+        [32]u8,
+        response[constants.tls_digest_pos..][0..32].*,
+        expected_hmac,
+    ));
 }
