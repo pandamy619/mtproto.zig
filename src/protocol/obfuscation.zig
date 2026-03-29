@@ -202,3 +202,33 @@ test "generateNonce produces valid nonces" {
     try std.testing.expect(isValidNonce(&nonce));
     try std.testing.expectEqual(@as(usize, constants.handshake_len), nonce.len);
 }
+
+test "prepareTgNonce - intermediate tag" {
+    var nonce: [64]u8 = [_]u8{0x00} ** 64;
+    prepareTgNonce(&nonce, constants.ProtoTag.intermediate, null);
+    
+    // Check that bytes 56-59 are the intermediate tag (eeeeeeee)
+    const expected_tag = constants.ProtoTag.intermediate.toBytes();
+    try std.testing.expectEqualStrings(&expected_tag, nonce[56..60]);
+}
+
+test "prepareTgNonce - fast mode key inversion" {
+    var nonce: [64]u8 = [_]u8{0x00} ** 64;
+    
+    // 32-byte key + 16-byte IV = 48 bytes
+    var client_key_iv: [48]u8 = undefined;
+    for (0..48) |i| client_key_iv[i] = @intCast(i);
+    
+    prepareTgNonce(&nonce, constants.ProtoTag.abridged, &client_key_iv);
+    
+    // Check proto tag
+    const expected_tag = constants.ProtoTag.abridged.toBytes();
+    try std.testing.expectEqualStrings(&expected_tag, nonce[56..60]);
+    
+    // Check key inversion at offset 8 (skip_len)
+    // The key_iv should be written entirely in reverse
+    for (0..48) |i| {
+        const expected_byte = client_key_iv[48 - 1 - i];
+        try std.testing.expectEqual(expected_byte, nonce[8 + i]);
+    }
+}

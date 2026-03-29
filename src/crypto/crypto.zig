@@ -202,7 +202,9 @@ pub fn sha1(data: []const u8) [20]u8 {
 pub fn md5(data: []const u8) [16]u8 {
     var h = std.crypto.hash.Md5.init(.{});
     h.update(data);
-    return h.finalResult();
+    var out: [16]u8 = undefined;
+    h.final(&out);
+    return out;
 }
 
 // ============= Secure Random =============
@@ -310,4 +312,23 @@ test "sha256Hmac basic" {
         0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8,
     };
     try std.testing.expectEqualSlices(u8, &expected, &mac);
+}
+
+test "sha1 basic" {
+    const hash = sha1("abc");
+    const expected = [_]u8{
+        0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a,
+        0xba, 0x3e, 0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c,
+        0x9c, 0xd0, 0xd8, 0x9d,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &hash);
+}
+
+test "md5 basic" {
+    const hash = md5("message digest");
+    const expected = [_]u8{
+        0xf9, 0x6b, 0x69, 0x7d, 0x7c, 0xb7, 0x93, 0x8d,
+        0x52, 0x5a, 0x2f, 0x31, 0xaa, 0xf1, 0x61, 0xd0,
+    };
+    try std.testing.expectEqualSlices(u8, &expected, &hash);
 }

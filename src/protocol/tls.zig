@@ -413,3 +413,62 @@ test "buildServerHello produces valid three-record structure" {
         expected_hmac,
     ));
 }
+
+test "validateTlsHandshake - valid handshake" {
+    const allocator = std.testing.allocator;
+    
+    // Create mock secrets
+    var secrets = [_]UserSecret{
+        .{ .name = "alice", .secret = [_]u8{0x1A} ** 16 },
+        .{ .name = "bob", .secret = [_]u8{0x2B} ** 16 },
+    };
+
+    // Client hello mock
+    // min_len = 11 + 32 + 1 = 44 bytes minimum
+    var handshake = [_]u8{0x00} ** 64;
+    // Set timestamp (say 123456789 = 0x075BCD15) 
+    // Wait, the client sends digest WITH timestamp XOR'd in the last 4 bytes.
+    // If ignore_time_skew = true, the proxy doesn't care what timestamp is.
+    // Proxy calculates HMAC on handshake with zeroed digest, then expects it to match (up to 28 bytes) the given digest.
+    
+    var hmac_input = std.mem.zeroes([64]u8);
+    // Add session id len
+    hmac_input[43] = 4; // session_id len
+    hmac_input[44] = 0xaa; // session ID
+    
+    // Compute HMAC
+    const computed_mac = crypto.sha256Hmac(&secrets[1].secret, &hmac_input);
+    
+    // Create the actual handshake by copying hmac_input and setting the digest with some timestamp
+    @memcpy(&handshake, &hmac_input);
+    @memcpy(handshake[constants.tls_digest_pos..][0..28], computed_mac[0..28]);
+    
+    // XOR timestamp into the last 4 bytes of digest
+    const timestamp: u32 = 0x12345678;
+    const ts_bytes = std.mem.toBytes(timestamp);
+    handshake[constants.tls_digest_pos + 28] = computed_mac[28] ^ ts_bytes[0];
+    handshake[constants.tls_digest_pos + 29] = computed_mac[29] ^ ts_bytes[1];
+    handshake[constants.tls_digest_pos + 30] = computed_mac[30] ^ ts_bytes[2];
+    handshake[constants.tls_digest_pos + 31] = computed_mac[31] ^ ts_bytes[3];
+
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("bob", result.?.user);
+    try std.testing.expectEqual(@as(u32, 0x12345678), result.?.timestamp);
+}
+
+test "validateTlsHandshake - invalid user" {
+    const allocator = std.testing.allocator;
+    var secrets = [_]UserSecret{.{ .name = "alice", .secret = [_]u8{0x1A} ** 16 }};
+    var handshake = [_]u8{0xAA} ** 64; // random junk
+
+    const result = try validateTlsHandshake(allocator, &handshake, &secrets, true);
+    try std.testing.expect(result == null);
+}
+
+test "extractSni - malformed returns null" {
+    // Too short
+    try std.testing.expect(extractSni(&[_]u8{ 0x16, 0x03, 0x01, 0x00 }) == null);
+    // Not a handshake type
+    try std.testing.expect(extractSni(&[_]u8{ 0x17, 0x03, 0x01, 0x00, 0x00 }) == null);
+}

@@ -6,13 +6,19 @@
 const std = @import("std");
 
 pub const Config = struct {
+    pub const UserSecret = struct { name: []const u8, secret: [16]u8 };
+
     port: u16 = 443,
     tls_domain: []const u8 = "google.com",
     users: std.StringHashMap([16]u8),
     /// Whether to mask bad clients (forward to tls_domain)
     mask: bool = true,
+    /// Test-only hook to override the mask port
+    mask_port: u16 = 443,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
+    /// Test-only hook to redirect upstream connections locally
+    datacenter_override: ?std.net.Address = null,
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -96,27 +102,26 @@ pub const Config = struct {
     }
 
     /// Get user secrets as a flat slice for handshake validation.
-    pub fn getUserSecrets(self: *const Config, allocator: std.mem.Allocator) ![]const struct { name: []const u8, secret: [16]u8 } {
-        const Entry = struct { name: []const u8, secret: [16]u8 };
-        var list = std.ArrayList(Entry).init(allocator);
+    pub fn getUserSecrets(self: *const Config, allocator: std.mem.Allocator) ![]const UserSecret {
+        var list: std.ArrayList(UserSecret) = .empty;
         var it = @constCast(&self.users).iterator();
         while (it.next()) |entry| {
-            try list.append(.{
+            try list.append(allocator, .{
                 .name = entry.key_ptr.*,
                 .secret = entry.value_ptr.*,
             });
         }
-        return try list.toOwnedSlice();
+        return try list.toOwnedSlice(allocator);
     }
 };
 
 // ============= Tests =============
 
-test "parse config" {
+test "parse config - valid complete" {
     const content =
         \\[server]
         \\port = 8443
-        \\fast_mode = false
+        \\fast_mode = true
         \\
         \\[censorship]
         \\tls_domain = "example.com"
@@ -133,10 +138,73 @@ test "parse config" {
     try std.testing.expectEqual(@as(u16, 8443), cfg.port);
     try std.testing.expectEqualStrings("example.com", cfg.tls_domain);
     try std.testing.expect(cfg.mask);
-    try std.testing.expect(!cfg.fast_mode);
+    try std.testing.expect(cfg.fast_mode);
     try std.testing.expectEqual(@as(usize, 2), cfg.users.count());
 
     const alice_secret = cfg.users.get("alice").?;
-    try std.testing.expectEqual(@as(u8, 0x00), alice_secret[0]);
-    try std.testing.expectEqual(@as(u8, 0xff), alice_secret[15]);
+    try std.testing.expectEqual([_]u8{ 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff }, alice_secret);
+}
+
+test "parse config - missing fields defaults" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 443), cfg.port);
+    try std.testing.expectEqualStrings("google.com", cfg.tls_domain);
+    try std.testing.expect(cfg.mask); // Default is true
+    try std.testing.expect(!cfg.fast_mode); // Default is false
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+}
+
+test "parse config - spaces and tabs" {
+    const content =
+        \\[server]
+        \\  port   =   9999   
+        \\[censorship]
+        \\  tls_domain= "test.com"  
+        \\[access.users]
+        \\  user  = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 9999), cfg.port);
+    try std.testing.expectEqualStrings("test.com", cfg.tls_domain);
+    try std.testing.expect(cfg.users.contains("user"));
+}
+
+test "parse config - invalid hex secret skipped" {
+    const content =
+        \\[access.users]
+        \\valid = "00112233445566778899aabbccddeeff"
+        \\invalid_len = "001122"
+        \\invalid_hex = "zz112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+    try std.testing.expect(cfg.users.contains("valid"));
+}
+
+test "parse config - getUserSecrets" {
+    const content =
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    const secrets = try cfg.getUserSecrets(std.testing.allocator);
+    defer std.testing.allocator.free(secrets);
+
+    try std.testing.expectEqual(@as(usize, 1), secrets.len);
+    try std.testing.expectEqualStrings("alice", secrets[0].name);
 }

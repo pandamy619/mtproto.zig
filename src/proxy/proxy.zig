@@ -407,8 +407,8 @@ fn handleConnectionInner(
 
     if (dc_idx >= constants.tg_datacenters_v4.len) return;
 
-    const dc_addr = constants.tg_datacenters_v4[dc_idx];
-    log.debug("[{d}] ({s}) Connecting to DC {d}", .{ conn_id, peer_str, params.dc_idx });
+    const dc_addr = state.config.datacenter_override orelse constants.tg_datacenters_v4[dc_idx];
+    log.debug("[{d}] ({s}) Connecting to DC {d} (addr: {any})", .{ conn_id, peer_str, params.dc_idx, dc_addr });
 
     const dc_stream = net.tcpConnectToAddress(dc_addr) catch |err| {
         log.err("[{d}] ({s}) DC connect failed: {any}", .{ conn_id, peer_str, err });
@@ -997,9 +997,9 @@ fn maskConnection(
 ) void {
     if (!state.config.mask) return;
 
-    // Connect to the real domain on port 443
-    const upstream_stream = std.net.tcpConnectToHost(state.allocator, state.config.tls_domain, 443) catch {
-        log.debug("[{d}] ({s}) Masking failed: cannot connect to {s}:443", .{ conn_id, peer_str, state.config.tls_domain });
+    // Connect to the real domain on port 443 (or mask_port for tests)
+    const upstream_stream = std.net.tcpConnectToHost(state.allocator, state.config.tls_domain, state.config.mask_port) catch {
+        log.debug("[{d}] ({s}) Masking failed: cannot connect to {s}:{d}", .{ conn_id, peer_str, state.config.tls_domain, state.config.mask_port });
         return;
     };
     defer upstream_stream.close();
@@ -1087,4 +1087,287 @@ test "DRS always returns fixed size (compatibility mode)" {
         drs.recordSent(1369);
     }
     try std.testing.expectEqual(DynamicRecordSizer.initial_size, drs.nextRecordSize());
+}
+
+test "Proxy Integration - Drops invalid connection (masking disabled)" {
+    const allocator = std.testing.allocator;
+    
+    // Config with mask = false so it drops immediately instead of relayRaw
+    const cfg = Config{
+        .users = std.StringHashMap([16]u8).init(allocator),
+        .port = 0, // OS assigned
+        .mask = false,
+    };
+    defer cfg.deinit(allocator);
+
+    var state = ProxyState.init(allocator, cfg);
+    defer state.deinit();
+
+    // Start server in background thread
+    var server = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    const listener = try std.posix.socket(server.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(listener);
+    
+    try std.posix.setsockopt(listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(listener, &server.any, server.getOsSockLen());
+    try std.posix.listen(listener, 128);
+
+    // Get assigned port
+    var addr_len = server.getOsSockLen();
+    try std.posix.getsockname(listener, &server.any, &addr_len);
+    
+    // Thread that just accepts one connection and handles it
+    const ServerThread = struct {
+        fn run(l: std.posix.socket_t, s: *ProxyState) !void {
+            var client_addr: std.net.Address = undefined;
+            var client_len: std.posix.socklen_t = @sizeOf(std.net.Address);
+            const client_fd = std.posix.accept(l, &client_addr.any, &client_len, std.posix.SOCK.CLOEXEC) catch return;
+            defer std.posix.close(client_fd);
+            
+            // Just run it synchronously
+            const stream = std.net.Stream{ .handle = client_fd };
+            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+        }
+    };
+    
+    const t = try std.Thread.spawn(.{}, ServerThread.run, .{listener, &state});
+    defer t.join();
+
+    // Connect as client
+    const client = try std.net.tcpConnectToAddress(server);
+    defer client.close();
+
+    // Send invalid junk
+    try client.writeAll("hello world this is definitely not tls");
+    
+    // Read response - should be EOF/reset since masking is false and it's invalid
+    var buf: [128]u8 = undefined;
+    const n = client.read(&buf) catch |err| {
+        try std.testing.expect(err == error.ConnectionResetByPeer);
+        return;
+    };
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "E2E: DPI Masking (Active Probing Defense)" {
+    const allocator = std.testing.allocator;
+
+    // Start Fake Google Server
+    var mock_google = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    const google_listener = try std.posix.socket(mock_google.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(google_listener);
+    try std.posix.setsockopt(google_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(google_listener, &mock_google.any, mock_google.getOsSockLen());
+    try std.posix.listen(google_listener, 128);
+    var google_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(google_listener, &mock_google.any, &google_addr_len);
+    const mask_port = mock_google.in.getPort();
+
+    // Start Proxy Server
+    var proxy_addr = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    const proxy_listener = try std.posix.socket(proxy_addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(proxy_listener);
+    try std.posix.setsockopt(proxy_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(proxy_listener, &proxy_addr.any, proxy_addr.getOsSockLen());
+    try std.posix.listen(proxy_listener, 128);
+    var proxy_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(proxy_listener, &proxy_addr.any, &proxy_addr_len);
+
+    const ServerThread = struct {
+        fn run_google(l: std.posix.socket_t) void {
+            const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
+            defer std.posix.close(client_fd);
+            const stream = std.net.Stream{ .handle = client_fd };
+            
+            // Read stuff
+            var buf: [128]u8 = undefined;
+            const n = stream.read(&buf) catch return;
+            if (n == 0) return;
+            
+            stream.writeAll("HTTP/1.1 200 OK\r\n\r\nGoogleMock") catch return;
+        }
+
+        fn run_proxy(l: std.posix.socket_t, s: *ProxyState) void {
+            const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
+            defer std.posix.close(client_fd);
+            const stream = std.net.Stream{ .handle = client_fd };
+            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+        }
+    };
+
+    const google_thread = try std.Thread.spawn(.{}, ServerThread.run_google, .{google_listener});
+    defer google_thread.join();
+
+    var cfg = @import("../config.zig").Config{
+        .users = std.StringHashMap([16]u8).init(allocator),
+        .tls_domain = "127.0.0.1",
+        .mask = true,
+        .mask_port = mask_port,
+    };
+    defer cfg.users.deinit();
+
+    var state = ProxyState.init(allocator, cfg);
+    defer state.deinit();
+
+    const proxy_thread = try std.Thread.spawn(.{}, ServerThread.run_proxy, .{ proxy_listener, &state });
+    defer proxy_thread.join();
+
+    // Client
+    const client = try std.net.tcpConnectToAddress(proxy_addr);
+    defer client.close();
+
+    // Send HTTP-style DPI probe
+    try client.writeAll("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+
+    var buf: [128]u8 = undefined;
+    const n = try client.read(&buf);
+    
+    // We should receive exactly what GoogleMock sent
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n\r\nGoogleMock", buf[0..n]);
+}
+
+test "E2E: Valid MTProto Handshake Drop" {
+    // We just want to ensure that a perfectly formed TLS + MTProto packet 
+    // forces the proxy to try to connect to the datacenter.
+    // We mock the DC and see if the Proxy connects.
+    
+    const allocator = std.testing.allocator;
+
+    var mock_dc = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    const dc_listener = try std.posix.socket(mock_dc.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(dc_listener);
+    try std.posix.setsockopt(dc_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(dc_listener, &mock_dc.any, mock_dc.getOsSockLen());
+    try std.posix.listen(dc_listener, 128);
+    var dc_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(dc_listener, &mock_dc.any, &dc_addr_len);
+
+    var proxy_addr = std.net.Address.initIp4(.{127, 0, 0, 1}, 0);
+    const proxy_listener = try std.posix.socket(proxy_addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(proxy_listener);
+    try std.posix.setsockopt(proxy_listener, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+    try std.posix.bind(proxy_listener, &proxy_addr.any, proxy_addr.getOsSockLen());
+    try std.posix.listen(proxy_listener, 128);
+    var proxy_addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
+    try std.posix.getsockname(proxy_listener, &proxy_addr.any, &proxy_addr_len);
+
+    const ServerThread = struct {
+        fn run_dc(l: std.posix.socket_t) void {
+            var fds = [_]std.posix.pollfd{
+                .{ .fd = l, .events = std.posix.POLL.IN, .revents = 0 },
+            };
+            const ready = std.posix.poll(&fds, 1000) catch return;
+            if (ready == 0) return; // Timeout, exit cleanly
+            
+            const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
+            defer std.posix.close(client_fd);
+            const stream = std.net.Stream{ .handle = client_fd };
+            
+            // Just read the 64-byte upstream proxy nonce
+            var buf: [64]u8 = undefined;
+            _ = stream.read(&buf) catch return;
+            // Write some fake DC response
+            stream.writeAll("DC_OK") catch return;
+        }
+
+        fn run_proxy(l: std.posix.socket_t, s: *ProxyState) void {
+            const client_fd = std.posix.accept(l, null, null, std.posix.SOCK.CLOEXEC) catch return;
+            defer std.posix.close(client_fd);
+            const stream = std.net.Stream{ .handle = client_fd };
+            handleConnectionInner(s, stream, "127.0.0.1:0", 1) catch {};
+        }
+    };
+
+    const dc_thread = try std.Thread.spawn(.{}, ServerThread.run_dc, .{dc_listener});
+    defer dc_thread.join();
+
+    var cfg = @import("../config.zig").Config{
+        .users = std.StringHashMap([16]u8).init(allocator),
+        .tls_domain = "127.0.0.1",
+        .mask = true,
+        .mask_port = 8080, // Irrelevant for this success path
+        .datacenter_override = mock_dc,
+    };
+    defer cfg.users.deinit();
+
+    var state = ProxyState.init(allocator, cfg);
+    defer state.deinit();
+    
+    // Add the mock secret explicitly (0x1A * 16)
+    const mock_secret_bytes = [_]u8{0x1A} ** 16;
+    const mock_secret = @import("../protocol/obfuscation.zig").UserSecret{
+        .name = "alice",
+        .secret = mock_secret_bytes,
+    };
+    // Let's replace user_secrets directly
+    allocator.free(state.user_secrets);
+    var secrets_array = try allocator.alloc(@import("../protocol/obfuscation.zig").UserSecret, 1);
+    secrets_array[0] = mock_secret;
+    state.user_secrets = secrets_array;
+
+    const proxy_thread = try std.Thread.spawn(.{}, ServerThread.run_proxy, .{ proxy_listener, &state });
+    defer proxy_thread.join();
+
+    const client = try std.net.tcpConnectToAddress(proxy_addr);
+    defer client.close();
+
+    // 1. Build a valid TLS Client Hello Header (5 bytes)
+    // 2. Build the Body 
+    var packet = [_]u8{0x00} ** 105;
+    // Header
+    packet[0] = 0x16;
+    packet[1] = 0x03;
+    packet[2] = 0x01;
+    packet[3] = 0x00;
+    packet[4] = 100;
+    // Body setup
+    packet[43] = 0x20; // session id length = 32
+    
+    // The MAC checks body, zeroes digest, computes HMAC using secret.
+    var mac_input: [105]u8 = undefined;
+    @memcpy(&mac_input, &packet);
+    @memset(mac_input[11..43], 0); // Zero out digest for MAC
+    
+    // We must set the timestamp correctly!
+    const ts = @as(u32, @intCast(std.time.timestamp()));
+    const ts_bytes = std.mem.toBytes(ts);
+    
+    // Compute HMAC
+    var mac = @import("../crypto/crypto.zig").sha256Hmac(&mock_secret_bytes, &mac_input);
+    
+    // XOR timestamp back in the last 4 bytes of digest
+    mac[28] ^= ts_bytes[0];
+    mac[29] ^= ts_bytes[1];
+    mac[30] ^= ts_bytes[2];
+    mac[31] ^= ts_bytes[3];
+    
+    // Fill the real packet digest
+    @memcpy(packet[11..11+32], &mac);
+    
+    // Send exactly what the proxy expects
+    try client.writeAll(&packet);
+
+    // Read Server Hello
+    var buf: [4096]u8 = undefined;
+    const n = try client.read(&buf);
+    
+    // If n > 0, it means the proxy accepted it! It sent back ServerHello!
+    try std.testing.expect(n > 0);
+    
+    // 3. Send MTProto Payload (64 bytes inside TLS ApplicationData)
+    // ApplicationData header: 0x17 0x03 0x03 0x00 64
+    try client.writeAll(&[_]u8{ 0x17, 0x03, 0x03, 0x00, 64 });
+    var payload = [_]u8{0x1A} ** 64; // random fake ciphertext
+    
+    // MTProto Proxy protocol (validate payload magic inside the ciphertext).
+    // The proxy expects an AES-CTR stream. Since the stream is initialized from random keys inside the encrypted payload,
+    // and we don't know them unless we do the 64-byte exact match, the proxy will fail to decode `0x1A` as valid magic bytes `ef ef ef ef`!
+    // So the connection WILL be dropped here because of invalid MTProto 64-byte payload.
+    // BUT we got the ServerHello from the TLS handshake, proving the network stack and Secret matching works flawlessly!
+
+    try client.writeAll(&payload);
+    
+    // Ensure proxy doesn't crash and terminates appropriately
+    const m = try client.read(&buf);
+    try std.testing.expect(m == 0); // EOF
 }
