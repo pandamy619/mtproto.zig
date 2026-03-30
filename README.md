@@ -44,25 +44,26 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 ## &nbsp; How It Works
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
 sequenceDiagram
     participant C as Client
     participant P as Proxy
     participant DC as Telegram DC
 
-    rect rgb(40, 40, 60)
+    rect rgb(30, 30, 80)
     Note over C,P: Layer 1 — Fake TLS 1.3
     C->>P: TLS ClientHello (HMAC-SHA256 in random)
     P-->>C: TLS ServerHello + ChangeCipherSpec
     end
 
-    rect rgb(40, 60, 40)
+    rect rgb(20, 70, 30)
     Note over C,DC: Layer 2 — MTProto Obfuscation
     C->>P: TLS AppData ← 64-byte obfuscated handshake
     P->>DC: Obfuscated handshake (AES-256-CTR keys derived)
     DC-->>P: Obfuscated response
     end
 
-    rect rgb(60, 40, 40)
+    rect rgb(90, 30, 30)
     Note over C,DC: Layer 3 — Encrypted Relay
     C->>P: TLS( AES-CTR( data ) )
     P->>DC: AES-CTR( data )
