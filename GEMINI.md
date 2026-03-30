@@ -230,6 +230,7 @@ All relay sockets use these settings:
 13. Handshake timeout adjusted (60s).
 14. DRS frozen at 1369 bytes for compatibility.
 15. TLS Alert logging added.
+16. **Hairpin routing fix**: AmneziaVPN (Docker/WireGuard) on the same server blocked iOS VPN clients from reaching port 443 due to Docker's `FORWARD policy DROP`. Fixed with `iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT`.
 
 ---
 
@@ -242,6 +243,23 @@ Implemented a 100% loopback test capability:
 
 ### Re-enabling DRS
 Once iPhone connectivity is stable, test with the `DRS` ramp enabled (shifting to 16384-byte records after a threshold).
+
+---
+
+## Co-located AmneziaVPN / WireGuard
+
+When the proxy and AmneziaVPN run on the same server, iOS VPN clients cannot reach `host:443` by default.
+
+**Root cause**: iOS routes ALL traffic through the VPN tunnel (unlike macOS, which bypasses the tunnel for the VPN server's own IP). Packets exit the WireGuard tunnel inside Docker network `amn0` (`172.29.172.0/24`). Docker's default `FORWARD policy DROP` silently discards these packets before they reach the proxy on `eth0:443`.
+
+**Symptoms**: iPhone shows "checking..." / "Updating..." when VPN is active. Mac works fine. Existing connections survive VPN activation (sockets already established outside the tunnel).
+
+**Diagnosis**: `tcpdump -n -i any dst port 443` shows zero packets from the VPN subnet. `iptables -L FORWARD` shows `policy DROP`.
+
+**Fix**:
+```bash
+iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
+netfilter-persistent save
 
 ---
 

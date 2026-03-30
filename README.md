@@ -333,6 +333,25 @@ The proxy includes specific handling for iOS Telegram clients:
 
 > **Important** &nbsp; Many Russian ISPs (via TSPU/DPI) block known VPS IP ranges at the network level. If the proxy appears to connect but the app stays on "Updating...", try a server in a different country/provider. The `mask = true` setting helps prevent your IP from being flagged in the first place.
 
+## &nbsp; Running alongside AmneziaVPN / WireGuard
+
+If you run both the proxy and AmneziaVPN (or any WireGuard-based VPN) **on the same server**, iOS clients connected through the VPN will not be able to reach the proxy by default.
+
+**The problem:** iOS routes all traffic (including proxy connections) through the VPN tunnel. The packets exit the tunnel inside a Docker network (e.g. `172.29.172.0/24`), but Docker's default `FORWARD policy DROP` silently blocks them from reaching port 443 on the host. macOS VPN clients are not affected because they route traffic to the VPN server's own IP outside the tunnel.
+
+**The fix** — allow VPN clients to reach the proxy:
+
+```bash
+# Allow traffic from the VPN Docker subnet to the proxy port
+iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
+
+# Make the rule persistent across reboots
+apt-get install -y iptables-persistent
+netfilter-persistent save
+```
+
+> **Note** &nbsp; Replace `172.29.172.0/24` with your actual AmneziaVPN Docker subnet. Check it with `ip addr show | grep amn`.
+
 ## &nbsp; License
 
 [MIT](LICENSE) &copy; 2026 Aleksandr Kalashnikov
