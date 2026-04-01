@@ -18,12 +18,10 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 ---
 
 [Features](#-features) &nbsp;&bull;&nbsp;
-[How It Works](#-how-it-works) &nbsp;&bull;&nbsp;
 [Quick Start](#-quick-start) &nbsp;&bull;&nbsp;
 [Deploy](#-deploy-to-server) &nbsp;&bull;&nbsp;
 [Configuration](#-configuration) &nbsp;&bull;&nbsp;
-[Security](#-security) &nbsp;&bull;&nbsp;
-[Project Structure](#-project-structure)
+[Troubleshooting](#-troubleshooting-updating)
 
 </div>
 
@@ -44,59 +42,7 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 
-## &nbsp; How It Works
-
-```mermaid
-%%{init: {'theme': 'dark'}}%%
-sequenceDiagram
-    participant C as Client
-    participant P as Proxy
-    participant DC as Telegram DC
-
-    rect rgb(30, 30, 80)
-    Note over C,P: Layer 1 — Fake TLS 1.3
-    C->>P: TLS ClientHello (HMAC-SHA256 in random)
-    P-->>C: TLS ServerHello + ChangeCipherSpec
-    end
-
-    rect rgb(20, 70, 30)
-    Note over C,DC: Layer 2 — MTProto Obfuscation
-    C->>P: TLS AppData ← 64-byte obfuscated handshake
-    P->>DC: Obfuscated handshake (AES-256-CTR keys derived)
-    DC-->>P: Obfuscated response
-    end
-
-    rect rgb(90, 30, 30)
-    Note over C,DC: Layer 3 — Encrypted Relay
-    C->>P: TLS( AES-CTR( data ) )
-    P->>DC: AES-CTR( data )
-    DC-->>P: AES-CTR( data )
-    P-->>C: TLS( AES-CTR( data ) )
-    end
-```
-
-> **Layer 1 -- Fake TLS 1.3** &nbsp; The client embeds an HMAC-SHA256 digest (derived from its secret) in the ClientHello `random` field. The proxy validates it and responds with an indistinguishable ServerHello.
-
-> **Layer 2 -- MTProto Obfuscation** &nbsp; Inside the TLS tunnel, a 64-byte obfuscated handshake is exchanged. AES-256-CTR keys are derived via SHA-256 for bidirectional encryption.
-
-> **Layer 3 -- DC Relay** &nbsp; The proxy connects to the target Telegram datacenter (DC1-DC5), performs its own obfuscated handshake, and relays traffic between client and DC with re-encryption.
-
-> **Anti-censorship -- Masking** &nbsp; When an unauthenticated client connects (e.g. a DPI active probe), the proxy transparently forwards the connection to the real `tls_domain` (e.g. `wb.ru`). The prober receives a genuine TLS certificate and HTTP response, making the proxy indistinguishable from a real web server.
-
-## &nbsp; Benchmark Snapshot
-
-Measured locally (ReleaseSmall) and on a 1 vCPU Linux VPS under load.
-
-| | [mtprotoproxy](https://github.com/alexbers/mtprotoproxy) | [telemt](https://github.com/telemt/telemt) | **[mtproto.zig](https://github.com/sleep3r/mtproto.zig)** |
-|---|---|---|---|
-| **Language** | Python | Rust | **Zig** |
-| **RAM (Peak)** | > 50 MB | ~11.6 MB | **~6.8 MB** |
-| **RAM (Idle)**  | ~30 MB | ~3.0 MB | **~120 KB** |
-| **Binary Size** | N/A (Scripts) | ~17.0 MB | **126 KB** |
-| **Dependencies**| `cryptography`, `uvloop` | 150+ Crates | **0 (None)** |
-
-> Measured via systemd status and `/usr/bin/time -v` on an Ubuntu 24.04 server.
-> `mtproto.zig` is compiled statically via `zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-linux` and uses the standard library entirely for its cryptography, handshakes, and event loops.
+> **Engineering Notes:** For deep technical details, cryptography internals, systemd hardening, and benchmarks, see [GEMINI.md](GEMINI.md) (Engineering Notes).
 
 ## &nbsp; Quick Start
 
@@ -341,89 +287,33 @@ bob   = "ffeeddccbbaa99887766554433221100"
 
 > **Note** &nbsp; The configuration format is compatible with the Rust-based `telemt` proxy.
 
-## &nbsp; Security
+## &nbsp; Troubleshooting ("Updating...")
 
-| Measure | Details |
-|---------|---------|
-| Constant-time comparison | HMAC validation uses constant-time byte comparison to prevent timing attacks |
-| Key wiping | All key material is zeroed from memory after use |
-| Secure randomness | Cryptographically secure RNG for all nonces and key generation |
-| Anti-replay (timestamp) | Embedded timestamp validation rejects handshakes outside +/- 2 min window |
-| Anti-replay (digest cache) | 4096-entry ring buffer detects ТСПУ Revisor replay probes, forwards them to real `tls_domain` |
-| Nonce validation | Rejects nonces matching HTTP, plain MTProto, or TLS patterns |
-| Dynamic Record Sizing | TLS record sizes mimic real browsers, preventing traffic fingerprinting |
-| Connection masking | Invalid clients are proxied to the real `tls_domain`, defeating DPI active probes |
-| TCPMSS clamping | MSS=88 forces ClientHello fragmentation, breaking passive DPI signature detection |
-| IPv6 address hopping | Rotates server IPv6 from /64 subnet on ban detection (TSPU can't ban /64 blocks) |
-| Systemd hardening | Runs as unprivileged user with `NoNewPrivileges`, `ProtectSystem=strict` |
+If your Telegram app is stuck on "Updating...", your provider or network is dropping the connection.
 
-## &nbsp; Project Structure
+### 1. Home Wi-Fi restricts IPv4
 
-```
-├── deploy/
-│   ├── install.sh                One-line installer (incl. TCPMSS + IPv6 hop setup)
-│   ├── ipv6-hop.sh               IPv6 address rotation for DPI evasion
-│   └── mtproto-proxy.service     Systemd unit file
-│
-└── src/
-    ├── main.zig                  Entry point, banner, IP detection
-    ├── config.zig                TOML-like configuration parser
-    │
-    ├── crypto/
-    │   └── crypto.zig            AES-256-CTR/CBC, SHA-256, HMAC, SHA-1, MD5
-    │
-    ├── protocol/
-    │   ├── constants.zig         DC addresses, protocol tags, TLS constants
-    │   ├── tls.zig               Fake TLS 1.3 (ClientHello validation, ServerHello)
-    │   └── obfuscation.zig       MTProto v2 obfuscation & key derivation
-    │
-    └── proxy/
-        └── proxy.zig             TCP listener, connection handler, relay, DRS, ReplayCache
-```
+Often, mobile networks will connect instantly because they use **IPv6**, but Home Wi-Fi internet providers block the destination's IPv4 address directly at the gateway.
+**Solution:** Enable **IPv6 Prefix Delegation** on your home Wi-Fi router. 
+- Go to your router's admin panel (e.g., `192.168.1.1`).
+- Find the **IPv6** or **WAN/LAN** settings.
+- Enable `IPv6`, and specifically check **IA_PD** (Prefix Delegation) for the WAN/DHCP client, and **IA_NA** for the LAN/DHCP Server.
+- Reboot the router and verify your phone gets an IPv6 address at [test-ipv6.com](https://test-ipv6.com). 
 
-## &nbsp; iOS Compatibility
+### 2. Commercial / Premium VPNs Block Traffic
 
-The proxy includes specific handling for iOS Telegram clients:
+If your iPhone is connected to a **commercial/premium VPN** and stuck on "Updating...", the VPN provider is actively dropping the MTProto TLS traffic using their own DPI.
+**Solutions**:
+- **Switch Protocol**: Try switching the VPN protocol (e.g., Xray/VLESS to WireGuard).
+- **Self-Host**: Use a self-hosted VPN (like AmneziaWG) on your own server.
 
-- **Fast Mode (`fast_mode = true`)** — Highly recommended for iOS clients to fix the "Updating..." connection loop. This bypasses proxy S2C encryption and relies on the Telegram DC directly.
+### 3. Co-located WireGuard (Docker routing)
 
-- **Fragmented handshake assembly** — iOS may split the 64-byte MTProto handshake across multiple TLS AppData records or interleave CCS records
-- **Two-stage timeouts** — idle pool connections (common on iOS) get a generous 5-minute poll timeout; active data gets a tight 10s `SO_RCVTIMEO`
-- **Generous handshake timeout** — 60s timeout during handshake assembly (iOS may delay after ServerHello)
-- **Fixed record sizing** — TLS records are kept at MSS-sized 1369 bytes for maximum compatibility
-
-> **Important**   Russian ISPs (МГТС/Ростелеком/МегаФон) use ТСПУ DPI that detects FakeTLS signatures within ~10 minutes, then bans the VPS IP via BGP blackhole. Three countermeasures are built in:
-> - **Anti-Replay Cache** — detects "Revisor" active probes (replay attacks), forwards them to real `wb.ru`
-> - **TCPMSS=88** — forces iOS to fragment ClientHello into 6+ TCP packets, breaking DPI signature detection
-> - **IPv6 Address Hopping** — auto-rotates `/64` subnet addresses on ban detection (ТСПУ never bans /64 blocks)
-
-## &nbsp; Running alongside AmneziaVPN / WireGuard
-
-If you run both the proxy and AmneziaVPN (or any WireGuard-based VPN) **on the same server**, iOS clients connected through the VPN will not be able to reach the proxy by default.
-
-**The problem:** iOS routes all traffic (including proxy connections) through the VPN tunnel. The packets exit the tunnel inside a Docker network (e.g. `172.29.172.0/24`), but Docker's default `FORWARD policy DROP` silently blocks them from reaching port 443 on the host. macOS VPN clients are not affected because they route traffic to the VPN server's own IP outside the tunnel.
-
-**The fix** — allow VPN clients to reach the proxy:
-
+If you run both this proxy and AmneziaVPN (or a WireGuard Docker container) **on the same server**, iOS clients will route proxy traffic inside the VPN tunnel, and Docker will drop the bridge packets.
+**Solution**: Allow traffic from the VPN Docker subnet:
 ```bash
-# Allow traffic from the VPN Docker subnet to the proxy port
 iptables -I DOCKER-USER -s 172.29.172.0/24 -p tcp --dport 443 -j ACCEPT
-
-# Make the rule persistent across reboots
-apt-get install -y iptables-persistent
-netfilter-persistent save
 ```
-
-> **Note** &nbsp; Replace `172.29.172.0/24` with your AmneziaVPN Docker subnet. For standard WireGuard without Docker, you might need to allow traffic from `10.8.1.0/24` (or whatever your `AllowedIPs` subnet is).
-
-### Commercial / Premium VPNs Block MTProto
-
-If your iPhone is connected to a **commercial/premium VPN** (even if using the Amnezia client or WireGuard protocol) and your MTProto proxy is stuck on "Updating...", the VPN provider is likely blocking the traffic.
-
-- **DPI & TLS Inspection**: Commercial VPNs often use DPI to inspect TLS traffic. FakeTLS mimics a normal HTTPS handshake, but if the VPN actively probes the connection or analyzes the payload structure, they may detect MTProto traffic and drop it.
-- **IP Blocking**: The VPN may outright block connections to Telegram datacenter IP ranges.
-
-**Solution**: Use a self-hosted VPN (like AmneziaWG) on your own server. Your own server won't restrict outbound MTProto traffic.
 
 ## &nbsp; License
 
