@@ -25,8 +25,8 @@ deploy:
 	zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 	ssh root@$(SERVER) 'systemctl stop mtproto-proxy || true'
 	scp zig-out/bin/mtproto-proxy root@$(SERVER):/opt/mtproto-proxy/
-	scp deploy/ipv6-hop.sh root@$(SERVER):/opt/mtproto-proxy/
-	ssh root@$(SERVER) 'chmod +x /opt/mtproto-proxy/ipv6-hop.sh'
+	scp deploy/*.sh root@$(SERVER):/opt/mtproto-proxy/
+	ssh root@$(SERVER) 'chmod +x /opt/mtproto-proxy/*.sh'
 	-if [ -f .env ]; then \
 		awk '{print "export " $$0}' .env > .env.tmp_deploy; \
 		scp .env.tmp_deploy root@$(SERVER):/opt/mtproto-proxy/env.sh; \

@@ -39,6 +39,9 @@ Disguises Telegram traffic as standard TLS 1.3 HTTPS to bypass network censorshi
 | **Promotion** | Tag Support | Optional promotion tag for sponsored proxy channel registration |
 | **IPv6 Hopping** | DPI Evasion | Auto-rotates IPv6 from /64 subnet on ban detection via Cloudflare API |
 | **TCPMSS=88** | DPI Evasion | Forces ClientHello fragmentation across 6 TCP packets, breaking ISP DPI reassembly |
+| **TCP Desync** | DPI Evasion | Integrated `zapret` (`nfqws`) OS-level desynchronization (fake packets + TTL spoofing) |
+| **Split-TLS** | DPI Evasion | 1-byte Application-level record chunking to defeat passive DPI signatures |
+| **Zero-RTT** | DPI Evasion | Local Nginx server deployed on-the-fly (`127.0.0.1:8443`) to defeat active probing timing analysis |
 | **0 deps** | Stdlib Only | Built entirely on the Zig standard library |
 | **0 globals** | Thread Safety | Dependency injection -- no global mutable state |
 

@@ -170,6 +170,17 @@ else
     info "Skipping IPv6 hopping setup (CF_TOKEN and CF_ZONE not set)"
 fi
 
+# ── OS-Level DPI Evasion (Zero-RTT Masking & Zapret) ────────
+info "Setting up Local Nginx Masking (zero-RTT)..."
+bash "$TMPBUILD/deploy/setup_masking.sh" "$TLS_DOMAIN" || warn "Masking setup failed"
+
+info "Setting up zapret nfqws TCP desync..."
+bash "$TMPBUILD/deploy/setup_nfqws.sh" || warn "nfqws setup failed"
+
+# Restart proxy to apply Mask Port and NFQUEUE capabilities
+systemctl restart "$SERVICE_NAME"
+ok "Advanced OS-Level DPI Evasion and Masking successfully configured!"
+
 # ── Cleanup ─────────────────────────────────────────────────
 rm -rf "$TMPBUILD"
 
@@ -198,6 +209,9 @@ echo ""
 echo -e "  ${BOLD}DPI Bypass active:${RESET}"
 echo -e "  ${GREEN}✓${RESET} Anti-Replay Cache (ТСПУ Revisor protection)"
 echo -e "  ${GREEN}✓${RESET} TCPMSS=88 (ClientHello fragmentation)"
+echo -e "  ${GREEN}✓${RESET} Local Nginx Dummy (Zero-RTT Active Probe defense)"
+echo -e "  ${GREEN}✓${RESET} Split-TLS (1-byte TLS Record chunking)"
+echo -e "  ${GREEN}✓${RESET} TCP Desync nfqws (Zapret OS fragmentation)"
 if [[ -f /etc/cron.d/mtproto-ipv6 ]]; then
 echo -e "  ${GREEN}✓${RESET} IPv6 auto-hopping every 5 min"
 else
