@@ -18,7 +18,10 @@ const proxy = @import("proxy/proxy.zig");
 // default logger uses, which causes catastrophic contention under
 // hundreds of concurrent threads.
 pub const std_options = std.Options{
-    .log_level = .debug,
+    // Do NOT set log_level here. In ReleaseFast, Zig's default is .info,
+    // which eliminates all log.debug calls at comptime (zero overhead).
+    // Setting .debug here floods stderr with thousands of messages/sec
+    // under heavy load, even with the lock-free logger.
     .logFn = lockFreeLog,
 };
 
