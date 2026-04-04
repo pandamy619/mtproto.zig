@@ -390,6 +390,7 @@ ad_tag = "1234567890abcdef1234567890abcdef"    # Optional alias for [server].tag
 [server]
 port = 443
 backlog = 4096                             # TCP listen queue size
+middleproxy_buffer_kb = 256               # Per-connection ME buffers (4x this size), tune for VPS RAM
 tag = "1234567890abcdef1234567890abcdef"   # Optional: promotion tag from @MTProxybot
 
 [censorship]
@@ -414,6 +415,7 @@ bob   = "ffeeddccbbaa99887766554433221100"
 | `[general]` | `ad_tag` | _(none)_ | Telemt-compatible alias for promotion tag; ignored if `[server].tag` is set |
 | `[server]` | `port` | `443` | TCP port to listen on |
 | `[server]` | `backlog` | `4096` | TCP listen queue size (for high-traffic loads) |
+| `[server]` | `middleproxy_buffer_kb` | `256` | MiddleProxy per-connection buffer size in KiB (4 buffers allocated for active ME sessions) |
 | `[server]` | `tag` | _(none)_ | Optional 32 hex-char promotion tag from [@MTProxybot](https://t.me/MTProxybot) |
 | `[censorship]` | `tls_domain` | `"google.com"` | Domain to impersonate / forward bad clients to |
 | `[censorship]` | `mask` | `true` | Forward unauthenticated connections to `tls_domain` to defeat DPI |

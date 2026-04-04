@@ -250,10 +250,10 @@ We currently keep this section strict: no behavior claims without either (a) rep
 ### iOS (Telegram iOS)
 - **Field evidence (our captures/logs)**: iOS pre-warms multiple idle sockets, can fragment the 64-byte obfuscation handshake across TLS records, and may delay first payload after `ServerHello`.
 - **Version-pinned source snapshot**: `TelegramMessenger/Telegram-iOS` tag `build-26855` (target commit `b16d9acdffa9b3f88db68e26b77a3713e87a92e3`).
-- In this source snapshot, TCP connect timeout is `12s` in `submodules/MtProtoKit/Sources/MTTcpConnection.m:980`.
-- Response watchdog is based on `MTMinTcpResponseTimeout = 12.0` (`submodules/MtProtoKit/Sources/MTTcpConnection.m:576`) plus payload-dependent term (`submodules/MtProtoKit/Sources/MTTcpConnection.m:1339`), and is reset on partial reads (`submodules/MtProtoKit/Sources/MTTcpConnection.m:1398`).
-- Transport-level connection watchdog is `20s` in `submodules/MtProtoKit/Sources/MTTcpTransport.m:312`.
-- Reconnect backoff in `submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m:66` is stepped (`1s` for early retries, then `4s`, then `8s`).
+- In this source snapshot, TCP connect timeout is `12s` in [`submodules/MtProtoKit/Sources/MTTcpConnection.m:980`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L980).
+- Response watchdog is based on `MTMinTcpResponseTimeout = 12.0` ([`submodules/MtProtoKit/Sources/MTTcpConnection.m:576`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L576)) plus payload-dependent term ([`submodules/MtProtoKit/Sources/MTTcpConnection.m:1339`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1339)), and is reset on partial reads ([`submodules/MtProtoKit/Sources/MTTcpConnection.m:1398`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnection.m#L1398)).
+- Transport-level connection watchdog is `20s` in [`submodules/MtProtoKit/Sources/MTTcpTransport.m:312`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpTransport.m#L312).
+- Reconnect backoff in [`submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m:66`](https://github.com/TelegramMessenger/Telegram-iOS/blob/b16d9acdffa9b3f88db68e26b77a3713e87a92e3/submodules/MtProtoKit/Sources/MTTcpConnectionBehaviour.m#L66) is stepped (`1s` for early retries, then `4s`, then `8s`).
 
 **Proxy-side handling used for iOS compatibility:**
 - Two-stage timeout model: `poll()` idle phase (5 min), then active `SO_RCVTIMEO=10s` after payload starts.
@@ -263,19 +263,19 @@ We currently keep this section strict: no behavior claims without either (a) rep
 
 ### Android (Telegram Android)
 - **Version-pinned source snapshot**: `DrKLO/Telegram` tag `release-11.4.2-5469` (commit `fb2e545101f41303f1e2712de2e7611a9335f1c3`).
-- Socket setup in `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:571` enables `TCP_NODELAY` (`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:574`), switches socket to `O_NONBLOCK` (`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:587`), and uses `connect(..., EINPROGRESS)` with edge-triggered epoll (`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLERR|EPOLLET`, `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:596`).
-- Timeout handling is internal logical timeout (`setTimeout`/`checkTimeout`) in `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:1066` and `TMessagesProj/jni/tgnet/ConnectionSocket.cpp:1076`.
-- Per-connection-type timeout profile is explicitly assigned in `TMessagesProj/jni/tgnet/Connection.cpp:368` and after first useful data in `TMessagesProj/jni/tgnet/Connection.cpp:131`.
-- Connection type split is explicit (`ConnectionTypeGeneric/Download/Upload/Push/Temp/Proxy`) in `TMessagesProj/jni/tgnet/Defines.h:68`, with multiple parallel slots (`PROXY_CONNECTIONS_COUNT=4`, `DOWNLOAD_CONNECTIONS_COUNT=2`, `UPLOAD_CONNECTIONS_COUNT=4`) in `TMessagesProj/jni/tgnet/Defines.h:26`.
-- Datacenter keeps separate connection objects/arrays per type in `TMessagesProj/jni/tgnet/Datacenter.h:88` and lazily creates/connects them in `TMessagesProj/jni/tgnet/Datacenter.cpp:835` and `TMessagesProj/jni/tgnet/Datacenter.cpp:1311`.
+- Socket setup in [`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:571`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L571) enables `TCP_NODELAY` ([`...:574`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L574)), switches socket to `O_NONBLOCK` ([`...:587`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L587)), and uses `connect(..., EINPROGRESS)` with edge-triggered epoll (`EPOLLIN|EPOLLOUT|EPOLLRDHUP|EPOLLERR|EPOLLET`, [`...:596`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L596)).
+- Timeout handling is internal logical timeout (`setTimeout`/`checkTimeout`) in [`TMessagesProj/jni/tgnet/ConnectionSocket.cpp:1066`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1066) and [`...:1076`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/ConnectionSocket.cpp#L1076).
+- Per-connection-type timeout profile is explicitly assigned in [`TMessagesProj/jni/tgnet/Connection.cpp:368`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Connection.cpp#L368) and after first useful data in [`...:131`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Connection.cpp#L131).
+- Connection type split is explicit (`ConnectionTypeGeneric/Download/Upload/Push/Temp/Proxy`) in [`TMessagesProj/jni/tgnet/Defines.h:68`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L68), with multiple parallel slots (`PROXY_CONNECTIONS_COUNT=4`, `DOWNLOAD_CONNECTIONS_COUNT=2`, `UPLOAD_CONNECTIONS_COUNT=4`) in [`...:26`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Defines.h#L26).
+- Datacenter keeps separate connection objects/arrays per type in [`TMessagesProj/jni/tgnet/Datacenter.h:88`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Datacenter.h#L88) and lazily creates/connects them in [`TMessagesProj/jni/tgnet/Datacenter.cpp:835`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Datacenter.cpp#L835) and [`...:1311`](https://github.com/DrKLO/Telegram/blob/fb2e545101f41303f1e2712de2e7611a9335f1c3/TMessagesProj/jni/tgnet/Datacenter.cpp#L1311).
 
 ### Windows (Telegram Desktop)
 - **Version-pinned source snapshot**: `telegramdesktop/tdesktop` tag `v6.7.2` (commit `085c4ba65d1f8aa13abf0fd7fc8489f094552542`).
-- MTProto layer prepares multiple "test connections" across endpoint/protocol variants in `Telegram/SourceFiles/mtproto/session_private.cpp:1010` and `Telegram/SourceFiles/mtproto/session_private.cpp:1065`, then selects by priority from `appendTestConnection` (`Telegram/SourceFiles/mtproto/session_private.cpp:192`, priority formula at `Telegram/SourceFiles/mtproto/session_private.cpp:199`).
-- Connection wait timeout starts from `kMinConnectedTimeout = 1000ms` (`Telegram/SourceFiles/mtproto/session_private.cpp:34`), scheduled via `_waitForConnectedTimer.callOnce(_waitForConnected)` (`Telegram/SourceFiles/mtproto/session_private.cpp:1111`), and grows up to max in `waitConnectedFailed` (`Telegram/SourceFiles/mtproto/session_private.cpp:1236`).
-- Transport full-connect timeout in TCP path is `8s` (`Telegram/SourceFiles/mtproto/connection_tcp.cpp:21`, `Telegram/SourceFiles/mtproto/connection_tcp.cpp:581`), and HTTP path is `8s` (`Telegram/SourceFiles/mtproto/connection_http.cpp:18`, `Telegram/SourceFiles/mtproto/connection_http.cpp:242`).
-- Resolving wrapper uses per-IP timeout `kOneConnectionTimeout = 4000` (`Telegram/SourceFiles/mtproto/connection_resolving.cpp:16`) and multiplies by number of resolved IPs in `Telegram/SourceFiles/mtproto/connection_resolving.cpp:187`.
-- After first success, Desktop may wait `kWaitForBetterTimeout = 2000ms` for a better candidate (`Telegram/SourceFiles/mtproto/session_private.cpp:33`, `Telegram/SourceFiles/mtproto/session_private.cpp:2336`).
+- MTProto layer prepares multiple "test connections" across endpoint/protocol variants in [`Telegram/SourceFiles/mtproto/session_private.cpp:1010`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1010) and [`...:1065`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1065), then selects by priority from `appendTestConnection` ([`...:192`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L192), priority formula at [`...:199`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L199)).
+- Connection wait timeout starts from `kMinConnectedTimeout = 1000ms` ([`Telegram/SourceFiles/mtproto/session_private.cpp:34`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L34)), scheduled via `_waitForConnectedTimer.callOnce(_waitForConnected)` ([`...:1111`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1111)), and grows up to max in `waitConnectedFailed` ([`...:1236`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L1236)).
+- Transport full-connect timeout in TCP path is `8s` ([`Telegram/SourceFiles/mtproto/connection_tcp.cpp:21`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L21), [`...:581`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_tcp.cpp#L581)), and HTTP path is `8s` ([`Telegram/SourceFiles/mtproto/connection_http.cpp:18`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_http.cpp#L18), [`...:242`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_http.cpp#L242)).
+- Resolving wrapper uses per-IP timeout `kOneConnectionTimeout = 4000` ([`Telegram/SourceFiles/mtproto/connection_resolving.cpp:16`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L16)) and multiplies by number of resolved IPs in [`...:187`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/connection_resolving.cpp#L187).
+- After first success, Desktop may wait `kWaitForBetterTimeout = 2000ms` for a better candidate ([`Telegram/SourceFiles/mtproto/session_private.cpp:33`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L33), [`...:2336`](https://github.com/telegramdesktop/tdesktop/blob/085c4ba65d1f8aa13abf0fd7fc8489f094552542/Telegram/SourceFiles/mtproto/session_private.cpp#L2336)).
 
 ### Ubuntu/Linux (Telegram Desktop)
 - Source-backed connection behavior currently maps to the same `tdesktop` MTProto files referenced in the Windows section above (`Telegram/SourceFiles/mtproto/*`, tag `v6.7.2`).
@@ -330,6 +330,20 @@ All relay sockets use these settings:
 - Fixed by writing RPC payload directly into `out_buf` with precomputed frame size and explicit bounds checks (`error.OutBufOverflow`).
 - Added regression test for payloads larger than 64KiB.
 
+### Connection Pressure Stability Harness
+- Added a standalone Linux/VPS harness at `test/connection_stability_check.py`.
+- It reproduces two real-world load shapes: idle-socket pools and high-churn short-lived reconnect storms.
+- It snapshots `/proc/<pid>/status` (`VmRSS`, `VmSize`, `Threads`) + FD count + `ss -tan` TCP state distribution.
+- It fails when post-load process metrics do not recover to baseline within configured deltas.
+- Reproduced `TIME-WAIT` storms under churn as expected TCP behavior; treat this separately from leak checks (RSS/threads/fds recovery).
+- Integrated in Make targets: `make stability-check` and `make stability-check-load`.
+
+### MiddleProxy Buffer Footprint Tuning
+- Added config key `[server].middleproxy_buffer_kb` (default `256`, minimum `64`).
+- This controls per-connection MiddleProxy stream buffers (`s2c_buf`, `s2c_out_buf`, `c2s_buf`, `c2s_out_buf`).
+- Effective per active MiddleProxy session memory for these buffers is now `4 * middleproxy_buffer_kb`.
+- Runtime default lowers pressure on 1GB VPS nodes while preserving room for large frames.
+
 ---
 
 ## Chronological Bug Fixes
@@ -365,6 +379,8 @@ All relay sockets use these settings:
 30. **Media/non-media routing split**: retain fast direct fallback for non-media timeouts while keeping media paths on MiddleProxy transport to preserve media load behavior.
 31. **Soak Gate in CI**: added `bench` job to `.github/workflows/ci.yml` that runs microbenchmarks and soak stress tests after unit tests pass. Tiered durations: 10s on PRs, 60s on main. Results uploaded as artifacts for perf drift tracking.
 32. **DRS re-enabled**: restored Dynamic Record Sizing ramp logic (1369→16384 bytes after 8 records or 128KB), gated by `drs = true` config flag in `[censorship]`. Default off for backward compatibility.
+33. **Connection stability harness**: added `test/connection_stability_check.py` and Make targets (`stability-check*`) to reproduce idle/churn socket pressure and detect non-recovering RSS/thread/fd growth.
+34. **MiddleProxy buffer tuning**: added `[server].middleproxy_buffer_kb` to cap per-connection ME buffering footprint on low-memory VPS deployments.
 
 ---
 

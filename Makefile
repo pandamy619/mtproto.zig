@@ -1,7 +1,10 @@
-.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual
+.PHONY: build release run test bench soak clean fmt deploy update-server migrate update-dns release-manual stability-check stability-check-load
 
 SERVER ?= 185.125.46.60
 CONFIG ?= config.toml
+HOST ?= 127.0.0.1
+PORT ?= 443
+PID ?=
 
 build:
 	zig build
@@ -89,3 +92,12 @@ migrate:
 update-dns:
 	@if [ -z "$(SERVER)" ]; then echo "Usage: make update-dns SERVER=<ip>"; exit 1; fi
 	bash deploy/update_dns.sh $(SERVER)
+
+# Linux/VPS regression harness (memory/socket churn)
+stability-check:
+	@if [ -z "$(PID)" ]; then echo "Usage: make stability-check PID=<mtproto_pid> [HOST=127.0.0.1 PORT=443]"; exit 1; fi
+	python3 test/connection_stability_check.py --host $(HOST) --port $(PORT) --pid $(PID) --idle-cycles 5
+
+# Load-only mode (no /proc assertions, useful for quick local smoke)
+stability-check-load:
+	python3 test/connection_stability_check.py --host $(HOST) --port $(PORT)

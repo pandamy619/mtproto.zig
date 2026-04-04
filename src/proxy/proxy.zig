@@ -1116,6 +1116,7 @@ fn handleConnectionInner(
             client_addr,
             mp_secret,
             state.config.tag,
+            state.config.middleProxyBufferBytes(),
         );
         log.debug("[{d}] MiddleProxy handshake successful (dc={d})", .{ conn_id, params.dc_idx });
     } else {

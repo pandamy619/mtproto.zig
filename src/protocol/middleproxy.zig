@@ -124,7 +124,45 @@ pub const MiddleProxyContext = struct {
     c2s_len: usize = 0,
     c2s_out_buf: []u8,
 
-    pub fn init(allocator: std.mem.Allocator, encryptor: crypto.AesCbc, decryptor: crypto.AesCbc, conn_id: [8]u8, initial_seq_no: i32, remote_addr: net.Address, our_addr: net.Address, proto_tag: constants.ProtoTag, ad_tag: ?[16]u8) !MiddleProxyContext {
+    pub const default_stream_buffer_size: usize = 128 * 1024;
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        encryptor: crypto.AesCbc,
+        decryptor: crypto.AesCbc,
+        conn_id: [8]u8,
+        initial_seq_no: i32,
+        remote_addr: net.Address,
+        our_addr: net.Address,
+        proto_tag: constants.ProtoTag,
+        ad_tag: ?[16]u8,
+    ) !MiddleProxyContext {
+        return initWithBuffer(
+            allocator,
+            encryptor,
+            decryptor,
+            conn_id,
+            initial_seq_no,
+            remote_addr,
+            our_addr,
+            proto_tag,
+            ad_tag,
+            default_stream_buffer_size,
+        );
+    }
+
+    pub fn initWithBuffer(
+        allocator: std.mem.Allocator,
+        encryptor: crypto.AesCbc,
+        decryptor: crypto.AesCbc,
+        conn_id: [8]u8,
+        initial_seq_no: i32,
+        remote_addr: net.Address,
+        our_addr: net.Address,
+        proto_tag: constants.ProtoTag,
+        ad_tag: ?[16]u8,
+        buffer_size: usize,
+    ) !MiddleProxyContext {
         var rip: [20]u8 = undefined;
         var rport: u16 = 0;
         if (remote_addr.any.family == posix.AF.INET) {
@@ -151,16 +189,16 @@ pub const MiddleProxyContext = struct {
         } else return error.UnsupportedAddressType;
         std.mem.writeInt(u32, oip[16..20], std.mem.bigToNative(u16, oport), .little);
 
-        const s2c_buf = try allocator.alloc(u8, 512 * 1024); // 512KB for max TLS/MTProto frames
+        const s2c_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(s2c_buf);
 
-        const s2c_out_buf = try allocator.alloc(u8, 512 * 1024);
+        const s2c_out_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(s2c_out_buf);
 
-        const c2s_buf = try allocator.alloc(u8, 512 * 1024);
+        const c2s_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(c2s_buf);
 
-        const c2s_out_buf = try allocator.alloc(u8, 512 * 1024);
+        const c2s_out_buf = try allocator.alloc(u8, buffer_size);
         errdefer allocator.free(c2s_out_buf);
 
         return .{
@@ -490,6 +528,7 @@ pub fn executeHandshake(
     client_addr: net.Address,
     proxy_secret_bytes: []const u8,
     ad_tag: ?[16]u8,
+    buffer_size: usize,
 ) !MiddleProxyContext {
     _ = dc_addr;
 
@@ -631,7 +670,7 @@ pub fn executeHandshake(
     var conn_id: [8]u8 = undefined;
     crypto.randomBytes(&conn_id);
 
-    return MiddleProxyContext.init(
+    return MiddleProxyContext.initWithBuffer(
         allocator,
         encryptor,
         decryptor,
@@ -641,6 +680,7 @@ pub fn executeHandshake(
         local_addr,
         proto_tag,
         ad_tag,
+        buffer_size,
     );
 }
 

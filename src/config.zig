@@ -27,8 +27,14 @@ pub const Config = struct {
     drs: bool = false,
     /// Fast mode: skip S2C encryption by passing client keys to DC directly
     fast_mode: bool = false,
+    /// Per-connection MiddleProxy stream buffers size, in KiB (applies to 4 buffers)
+    middleproxy_buffer_kb: u32 = 256,
     /// Test-only hook to redirect upstream connections locally
     datacenter_override: ?std.net.Address = null,
+
+    pub fn middleProxyBufferBytes(self: *const Config) usize {
+        return @as(usize, self.middleproxy_buffer_kb) * 1024;
+    }
 
     pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
         const file = try std.fs.cwd().openFile(path, .{});
@@ -113,6 +119,9 @@ pub const Config = struct {
                         }
                     } else if (std.mem.eql(u8, key, "fast_mode")) {
                         cfg.fast_mode = std.mem.eql(u8, value, "true");
+                    } else if (std.mem.eql(u8, key, "middleproxy_buffer_kb")) {
+                        const parsed = std.fmt.parseInt(u32, value, 10) catch cfg.middleproxy_buffer_kb;
+                        cfg.middleproxy_buffer_kb = @max(@as(u32, 64), parsed);
                     }
                 } else if (in_censorship_section) {
                     if (std.mem.eql(u8, key, "tls_domain")) {
@@ -216,7 +225,38 @@ test "parse config - missing fields defaults" {
     try std.testing.expect(cfg.mask); // Default is true
     try std.testing.expect(cfg.desync); // Default is true
     try std.testing.expect(!cfg.fast_mode); // Default is false
+    try std.testing.expectEqual(@as(u32, 256), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(usize, 256 * 1024), cfg.middleProxyBufferBytes());
     try std.testing.expectEqual(@as(usize, 1), cfg.users.count());
+}
+
+test "parse config - middleproxy buffer size" {
+    const content =
+        \\[server]
+        \\middleproxy_buffer_kb = 192
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 192), cfg.middleproxy_buffer_kb);
+    try std.testing.expectEqual(@as(usize, 192 * 1024), cfg.middleProxyBufferBytes());
+}
+
+test "parse config - middleproxy buffer lower bound" {
+    const content =
+        \\[server]
+        \\middleproxy_buffer_kb = 16
+        \\[access.users]
+        \\alice = "00112233445566778899aabbccddeeff"
+    ;
+
+    var cfg = try Config.parse(std.testing.allocator, content);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 64), cfg.middleproxy_buffer_kb);
 }
 
 test "parse config - spaces and tabs" {
