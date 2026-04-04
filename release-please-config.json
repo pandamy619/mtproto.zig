@@ -8,7 +8,10 @@
       "include-component-in-tag": false,
       "include-v-in-tag": true,
       "draft": false,
-      "prerelease": false
+      "prerelease": false,
+      "extra-files": [
+        "src/main.zig"
+      ]
     }
   }
 }
