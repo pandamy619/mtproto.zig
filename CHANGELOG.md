@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/sleep3r/mtproto.zig/compare/v0.6.1...v0.6.2) (2026-04-05)
+
+
+### Bug Fixes
+
+* **deploy:** ensure correct permissions on config and deploy dirs ([#72](https://github.com/sleep3r/mtproto.zig/issues/72)) ([1d3d4b2](https://github.com/sleep3r/mtproto.zig/commit/1d3d4b2e2bb7b159cb5f025384d188deec5ecae6))
+* **proxy:** harden fd-quota handling and nofile defaults ([#71](https://github.com/sleep3r/mtproto.zig/issues/71)) ([cb2751a](https://github.com/sleep3r/mtproto.zig/commit/cb2751ad2d299ef9a74b4ecc5d7906bf995bcaa5))
+
 ## [0.6.1](https://github.com/sleep3r/mtproto.zig/compare/v0.6.0...v0.6.1) (2026-04-05)
 
 
