@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/sleep3r/mtproto.zig/compare/v0.6.0...v0.6.1) (2026-04-05)
+
+
+### Bug Fixes
+
+* **proxy:** prevent epoll spin on failed upstream connect ([#67](https://github.com/sleep3r/mtproto.zig/issues/67)) ([2ace562](https://github.com/sleep3r/mtproto.zig/commit/2ace562c71db43662476a6b2b817ca91174b217a))
+
 ## [0.6.0](https://github.com/sleep3r/mtproto.zig/compare/v0.5.1...v0.6.0) (2026-04-05)
 
 Architectural rewrite: single-threaded Linux `epoll` event loop replaces the thread-per-connection model.
